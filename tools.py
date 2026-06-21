@@ -72,6 +72,11 @@ class AppointmentTools(llm.ToolContext):
         """
         try:
             booking_id = await insert_appointment(name, phone, date, time, service)
+            if booking_id is None:
+                return (
+                    f"Sorry, {date} at {time} was just booked by someone else. "
+                    f"Please call check_availability to find the next open slot."
+                )
             return f"Confirmed! Booking ID: {booking_id}. See you on {date} at {time} for {service}."
         except Exception:
             return "Technical issue saving the booking. Our team will confirm shortly."
@@ -161,9 +166,23 @@ class AppointmentTools(llm.ToolContext):
         Returns call history, appointments, and remembered details.
         """
         try:
-            calls = await get_calls_by_phone(phone)
-            appointments = await get_appointments_by_phone(phone)
-            memories = await get_contact_memory(phone)
+            # Run all three queries concurrently — saves ~200-400ms vs serial
+            calls, appointments, memories = await asyncio.gather(
+                get_calls_by_phone(phone),
+                get_appointments_by_phone(phone),
+                get_contact_memory(phone),
+                return_exceptions=True,
+            )
+            # Defensive: if any one query raised, treat it as empty rather than blowing up
+            if isinstance(calls, Exception):
+                logger.warning("lookup_contact: calls fetch failed: %s", calls)
+                calls = []
+            if isinstance(appointments, Exception):
+                logger.warning("lookup_contact: appointments fetch failed: %s", appointments)
+                appointments = []
+            if isinstance(memories, Exception):
+                logger.warning("lookup_contact: memories fetch failed: %s", memories)
+                memories = []
             if not calls and not appointments and not memories:
                 return f"No history for {phone}. First-time contact."
             lines = [f"Contact history for {phone}:"]

@@ -183,26 +183,38 @@ async def clear_errors() -> None:
 # ── Appointments ──────────────────────────────────────────────────────────────
 
 async def insert_appointment(name: str, phone: str, date: str, time: str, service: str) -> str:
+    """Insert only if slot is free. Returns booking_id on success, None if duplicate."""
+    # ── Pre-flight slot check (avoids duplicates) ──────────────────────────
+    if not await check_slot(date, time):
+        return None  # slot already taken — caller will surface to AI
     full_id = str(uuid.uuid4())
     booking_id = full_id[:8].upper()
     db = await _adb()
-    await db.table("appointments").insert({
-        "id": full_id, "name": name, "phone": phone,
-        "date": date, "time": time, "service": service,
-        "status": "booked", "created_at": datetime.now().isoformat(),
-    }).execute()
-    return booking_id
+    try:
+        await db.table("appointments").insert({
+            "id": full_id, "name": name, "phone": phone,
+            "date": date, "time": time, "service": service,
+            "status": "booked", "created_at": datetime.now().isoformat(),
+        }).execute()
+        return booking_id
+    except Exception:
+        # Race-condition fallback: try a second slot check; if taken now, reject
+        if not await check_slot(date, time):
+            return None
+        raise
 
 
 async def check_slot(date: str, time: str) -> bool:
     """Returns True if slot is available (no existing booking)."""
     db = await _adb()
+    # limit(1) instead of maybe_single() — works correctly even with duplicates.
+    # maybe_single() raises on >1 row; we just need "does any row exist?".
     result = await (
         db.table("appointments").select("id")
         .eq("date", date).eq("time", time).eq("status", "booked")
-        .maybe_single().execute()
+        .limit(1).execute()
     )
-    return result.data is None
+    return not (result.data or [])  # True = no booking exists = available
 
 
 async def get_next_available(date: str, time: str) -> str:

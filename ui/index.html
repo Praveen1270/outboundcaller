@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>OutboundAI — Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d0d0d;--card:#161616;--border:#252525;
+  --accent:#00ff88;--accent2:#00ccff;--danger:#ff4d4d;--warn:#ffaa00;
+  --muted:#5a5a5a;--text:#e0e0e0;--text2:#aaa;
+  --mono:'Courier New',monospace;--sans:'Segoe UI',system-ui,sans-serif;--r:8px;
+}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;line-height:1.5;font-size:14px}
+header{background:var(--card);border-bottom:1px solid var(--border);padding:12px 20px;position:sticky;top:0;z-index:100}
+header h1{font-size:18px;font-weight:600;color:var(--accent)}
+header h1 span{color:var(--text2);font-weight:400;font-size:13px;margin-left:8px}
+nav{display:flex;flex-wrap:wrap;gap:4px;margin-top:10px}
+nav button{background:transparent;border:1px solid transparent;color:var(--text2);padding:6px 12px;border-radius:var(--r);cursor:pointer;font-size:12px;transition:.15s}
+nav button:hover{color:var(--text);border-color:var(--border)}
+nav button.active{background:var(--border);color:var(--accent);border-color:var(--accent)}
+main{padding:20px;max-width:1400px;margin:0 auto}
+.panel{display:none}.panel.active{display:block}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:16px;margin-bottom:16px}
+.card h2{font-size:15px;margin-bottom:12px;color:var(--accent2)}
+.grid{display:grid;gap:12px}
+.grid-2{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.grid-3{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+.grid-5{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}
+.kpi{background:var(--bg);border:1px solid var(--border);border-radius:var(--r);padding:14px;text-align:center}
+.kpi .val{font-size:28px;font-weight:700;color:var(--accent);font-family:var(--mono)}
+.kpi .lbl{font-size:11px;color:var(--text2);margin-top:4px;text-transform:uppercase;letter-spacing:.5px}
+.chip{display:inline-block;background:var(--bg);border:1px solid var(--border);border-radius:20px;padding:3px 10px;font-size:11px;margin:2px}
+.chip.ok{border-color:var(--accent);color:var(--accent)}
+.chip.no{border-color:var(--muted);color:var(--muted)}
+label{display:block;font-size:12px;color:var(--text2);margin-bottom:4px;margin-top:10px}
+input,select,textarea{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:var(--r);color:var(--text);padding:8px 10px;font-size:13px;font-family:var(--sans)}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
+textarea{font-family:var(--mono);min-height:120px;resize:vertical}
+.btn{display:inline-block;background:var(--accent);color:#000;border:none;border-radius:var(--r);padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;margin-top:10px;margin-right:6px}
+.btn:hover{opacity:.9}
+.btn.secondary{background:var(--border);color:var(--text)}
+.btn.danger{background:var(--danger);color:#fff}
+.btn.warn{background:var(--warn);color:#000}
+.btn.sm{padding:4px 10px;font-size:11px;margin-top:0}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--border)}
+th{color:var(--text2);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+tr:hover td{background:rgba(255,255,255,.02)}
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}
+.badge.booked{background:#00ff8822;color:var(--accent)}
+.badge.not_interested,.badge.wrong_number{background:#ff4d4d22;color:var(--danger)}
+.badge.voicemail,.badge.no_answer,.badge.callback_requested{background:#ffaa0022;color:var(--warn)}
+.badge.active{background:#00ccff22;color:var(--accent2)}
+.badge.completed,.badge.paused{background:var(--border);color:var(--text2)}
+.err{color:var(--danger);font-size:12px;margin-top:4px}
+.progress{height:6px;background:var(--border);border-radius:3px;margin-top:8px;overflow:hidden}
+.progress-bar{height:100%;background:var(--accent);transition:width .3s;border-radius:3px}
+.chart-wrap{position:relative;height:220px}
+#toast-container{position:fixed;bottom:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:8px}
+.toast{padding:10px 16px;border-radius:var(--r);font-size:13px;animation:slideIn .3s;max-width:360px}
+.toast.ok{background:#00ff88cc;color:#000}
+.toast.err{background:#ff4d4dcc;color:#fff}
+@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+.flex{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.flex-between{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
+.eye-toggle{cursor:pointer;color:var(--accent2);font-size:12px;margin-left:6px}
+.group-title{font-size:13px;font-weight:600;color:var(--accent);margin:16px 0 8px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+.log-entry{font-family:var(--mono);font-size:12px;padding:4px 0;border-bottom:1px solid var(--border)}
+.log-entry .ts{color:var(--muted)}
+.log-entry.error .msg{color:var(--danger)}
+.log-entry.warning .msg{color:var(--warn)}
+.log-entry.info .msg{color:var(--accent2)}
+.hidden{display:none!important}
+.notes-input{width:100%;min-height:40px;font-size:12px}
+.crm-detail{background:var(--bg);border:1px solid var(--border);border-radius:var(--r);padding:12px;margin-top:12px}
+.setup-step{padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
+.setup-step strong{color:var(--accent)}
+.cost-table td:last-child{text-align:right;font-family:var(--mono)}
+@media(max-width:600px){main{padding:12px}nav button{font-size:11px;padding:5px 8px}}
+</style>
+</head>
+<body>
+<header>
+  <h1>OutboundAI <span>AI Outbound Voice Platform</span></h1>
+  <nav id="nav">
+    <button data-tab="stats" class="active">📊 Stats</button>
+    <button data-tab="single">📞 Single Call</button>
+    <button data-tab="batch">📋 Batch Call</button>
+    <button data-tab="campaigns">🚀 Campaigns</button>
+    <button data-tab="agents">🤖 Agents</button>
+    <button data-tab="prompt">✏️ AI Prompt</button>
+    <button data-tab="appointments">📅 Appointments</button>
+    <button data-tab="calls">📝 Call Logs</button>
+    <button data-tab="crm">👥 CRM</button>
+    <button data-tab="settings">⚙️ Settings</button>
+    <button data-tab="logs">📋 Logs</button>
+    <button data-tab="setup">🔧 Setup</button>
+  </nav>
+</header>
+<main>
+  <!-- STATS -->
+  <section id="panel-stats" class="panel active">
+    <div class="grid grid-5" id="kpi-grid">
+      <div class="kpi"><div class="val" id="kpi-total">—</div><div class="lbl">Total Calls</div></div>
+      <div class="kpi"><div class="val" id="kpi-booked">—</div><div class="lbl">Booked</div></div>
+      <div class="kpi"><div class="val" id="kpi-not">—</div><div class="lbl">Not Interested</div></div>
+      <div class="kpi"><div class="val" id="kpi-rate">—</div><div class="lbl">Booking Rate %</div></div>
+      <div class="kpi"><div class="val" id="kpi-dur">—</div><div class="lbl">Avg Duration (s)</div></div>
+    </div>
+    <div class="card" style="margin-top:16px"><h2>Live Config</h2><div id="live-config">Loading…</div></div>
+    <div class="grid grid-3" style="margin-top:16px">
+      <div class="card"><h2>Outcomes</h2><div class="chart-wrap"><canvas id="chart-outcomes"></canvas></div></div>
+      <div class="card"><h2>14-Day Timeline</h2><div class="chart-wrap"><canvas id="chart-timeline"></canvas></div></div>
+      <div class="card"><h2>Avg Duration by Outcome</h2><div class="chart-wrap"><canvas id="chart-duration"></canvas></div></div>
+    </div>
+  </section>
+
+  <!-- SINGLE CALL -->
+  <section id="panel-single" class="panel">
+    <div class="card">
+      <h2>Place Single Outbound Call</h2>
+      <form id="call-form">
+        <label>Phone (E.164)</label><input id="sc-phone" placeholder="+919876543210" required />
+        <label>Lead Name</label><input id="sc-lead" value="there" />
+        <label>Business Name</label><input id="sc-biz" value="our company" />
+        <label>Service Type</label><input id="sc-service" value="our service" />
+        <label>Agent Profile</label><select id="sc-agent-profile"><option value="">— Default —</option></select>
+        <label><input type="checkbox" id="sc-custom-prompt-cb" /> Use custom prompt override</label>
+        <textarea id="sc-prompt" class="hidden" placeholder="Custom system prompt…"></textarea>
+        <div id="sc-err" class="err"></div>
+        <button type="submit" class="btn">📞 Dispatch Call</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- BATCH CALL -->
+  <section id="panel-batch" class="panel">
+    <div class="card">
+      <h2>Batch CSV Dialer</h2>
+      <label>Agent Profile</label><select id="bc-agent-profile"><option value="">— Default —</option></select>
+      <label>Delay between calls (seconds)</label><input id="bc-delay" type="number" value="3" min="1" max="60" />
+      <label>CSV File (columns: phone, lead_name, business_name, service_type)</label>
+      <input type="file" id="bc-csv" accept=".csv" />
+      <button class="btn secondary" id="bc-parse">Parse CSV</button>
+      <div id="bc-preview" style="margin-top:12px;overflow-x:auto"></div>
+      <div class="progress hidden" id="bc-progress-wrap"><div class="progress-bar" id="bc-progress" style="width:0%"></div></div>
+      <button class="btn hidden" id="bc-start">Start Batch</button>
+      <div id="bc-err" class="err"></div>
+    </div>
+  </section>
+
+  <!-- CAMPAIGNS -->
+  <section id="panel-campaigns" class="panel">
+    <div class="card">
+      <h2>Create Campaign</h2>
+      <label>Name</label><input id="camp-name" />
+      <div class="grid grid-2">
+        <div><label>Schedule</label><select id="camp-schedule"><option value="once">Once (run now)</option><option value="daily">Daily</option><option value="weekdays">Weekdays</option></select></div>
+        <div><label>Time (HH:MM)</label><input id="camp-time" type="time" value="09:00" /></div>
+      </div>
+      <label>Delay (seconds)</label><input id="camp-delay" type="number" value="3" min="1" />
+      <label>Agent Profile</label><select id="camp-agent-profile"><option value="">— Default —</option></select>
+      <label><input type="checkbox" id="camp-custom-prompt-cb" /> Custom prompt</label>
+      <textarea id="camp-prompt" class="hidden"></textarea>
+      <label>CSV Contacts</label><input type="file" id="camp-csv" accept=".csv" />
+      <button class="btn secondary" id="camp-parse">Parse CSV</button>
+      <div id="camp-preview" style="margin-top:8px;overflow-x:auto"></div>
+      <button class="btn" id="camp-create">Create Campaign</button>
+      <div id="camp-err" class="err"></div>
+    </div>
+    <div class="card"><h2>Campaigns</h2><div id="camp-list" style="overflow-x:auto">Loading…</div></div>
+  </section>
+
+  <!-- AGENTS -->
+  <section id="panel-agents" class="panel">
+    <div class="card">
+      <h2 id="agent-form-title">Create Agent Profile</h2>
+      <input type="hidden" id="agent-edit-id" />
+      <label>Name</label><input id="agent-name" />
+      <label>Voice</label><select id="agent-voice"></select>
+      <label>Model</label><select id="agent-model">
+        <option value="gemini-3.1-flash-live-preview">gemini-3.1-flash-live-preview (recommended)</option>
+        <option value="gemini-2.5-flash-native-audio-preview-12-2025">gemini-2.5-flash-native-audio-preview-12-2025</option>
+      </select>
+      <label>Enabled Tools (JSON array, empty = all)</label><input id="agent-tools" value="[]" />
+      <label>System Prompt</label><textarea id="agent-prompt" style="min-height:200px"></textarea>
+      <label><input type="checkbox" id="agent-default" /> Set as default profile</label>
+      <button class="btn" onclick="saveAgentProfile()">Save Profile</button>
+      <button class="btn secondary" onclick="resetAgentForm()">Reset</button>
+    </div>
+    <div class="card"><h2>Agent Profiles</h2><div id="agent-list" style="overflow-x:auto">Loading…</div></div>
+  </section>
+
+  <!-- PROMPT -->
+  <section id="panel-prompt" class="panel">
+    <div class="card">
+      <h2>Global System Prompt</h2>
+      <textarea id="prompt-text" style="min-height:400px"></textarea>
+      <div class="flex-between"><span id="prompt-count" style="color:var(--text2);font-size:12px">0 chars</span>
+        <div><button class="btn" onclick="savePrompt()">Save</button><button class="btn secondary" onclick="resetPrompt()">Reset to Default</button></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- APPOINTMENTS -->
+  <section id="panel-appointments" class="panel">
+    <div class="card">
+      <div class="flex-between"><h2>Appointments</h2>
+        <div><label style="display:inline;margin:0">Filter date</label><input type="date" id="appt-date" style="width:auto;display:inline" /></div>
+      </div>
+      <div id="appt-list" style="overflow-x:auto;margin-top:12px">Loading…</div>
+    </div>
+  </section>
+
+  <!-- CALL LOGS -->
+  <section id="panel-calls" class="panel">
+    <div class="card">
+      <h2>Call Logs</h2>
+      <div id="calls-list" style="overflow-x:auto">Loading…</div>
+      <div class="flex" style="margin-top:12px">
+        <button class="btn secondary sm" id="calls-prev">← Prev</button>
+        <span id="calls-page" style="color:var(--text2)">Page 1</span>
+        <button class="btn secondary sm" id="calls-next">Next →</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- CRM -->
+  <section id="panel-crm" class="panel">
+    <div class="card">
+      <h2>Contacts</h2>
+      <div id="crm-list" style="overflow-x:auto">Loading…</div>
+      <div id="crm-detail" class="crm-detail hidden"></div>
+    </div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section id="panel-settings" class="panel">
+    <div class="card">
+      <div class="group-title">LiveKit</div>
+      <label>LIVEKIT_URL</label><input id="s-LIVEKIT_URL" />
+      <label>LIVEKIT_API_KEY <span class="eye-toggle" onclick="toggleEye('s-LIVEKIT_API_KEY')">👁</span></label><input id="s-LIVEKIT_API_KEY" type="password" />
+      <label>LIVEKIT_API_SECRET <span class="eye-toggle" onclick="toggleEye('s-LIVEKIT_API_SECRET')">👁</span></label><input id="s-LIVEKIT_API_SECRET" type="password" />
+      <button class="btn sm" onclick="saveGroup('livekit')">Save LiveKit</button>
+
+      <div class="group-title">Google Gemini</div>
+      <label>GOOGLE_API_KEY <span class="eye-toggle" onclick="toggleEye('s-GOOGLE_API_KEY')">👁</span></label><input id="s-GOOGLE_API_KEY" type="password" />
+      <label>GEMINI_MODEL</label><select id="s-GEMINI_MODEL"><option value="gemini-3.1-flash-live-preview">gemini-3.1-flash-live-preview</option><option value="gemini-2.5-flash-native-audio-preview-12-2025">gemini-2.5-flash-native-audio-preview-12-2025</option></select>
+      <label>GEMINI_TTS_VOICE</label><select id="s-GEMINI_TTS_VOICE"></select>
+      <label>USE_GEMINI_REALTIME</label><select id="s-USE_GEMINI_REALTIME"><option value="true">true</option><option value="false">false (pipeline fallback)</option></select>
+      <button class="btn sm" onclick="saveGroup('gemini')">Save Gemini</button>
+
+      <div class="group-title">Vobiz SIP</div>
+      <label>VOBIZ_SIP_DOMAIN</label><input id="s-VOBIZ_SIP_DOMAIN" />
+      <label>VOBIZ_USERNAME</label><input id="s-VOBIZ_USERNAME" />
+      <label>VOBIZ_PASSWORD <span class="eye-toggle" onclick="toggleEye('s-VOBIZ_PASSWORD')">👁</span></label><input id="s-VOBIZ_PASSWORD" type="password" />
+      <label>VOBIZ_OUTBOUND_NUMBER</label><input id="s-VOBIZ_OUTBOUND_NUMBER" />
+      <label>OUTBOUND_TRUNK_ID</label><input id="s-OUTBOUND_TRUNK_ID" />
+      <label>DEFAULT_TRANSFER_NUMBER</label><input id="s-DEFAULT_TRANSFER_NUMBER" />
+      <button class="btn sm" onclick="saveGroup('vobiz')">Save Vobiz</button>
+      <button class="btn warn sm" onclick="createSIPTrunk()">⚡ Create SIP Trunk in LiveKit</button>
+
+      <div class="group-title">Twilio SMS</div>
+      <label>TWILIO_ACCOUNT_SID</label><input id="s-TWILIO_ACCOUNT_SID" />
+      <label>TWILIO_AUTH_TOKEN <span class="eye-toggle" onclick="toggleEye('s-TWILIO_AUTH_TOKEN')">👁</span></label><input id="s-TWILIO_AUTH_TOKEN" type="password" />
+      <label>TWILIO_FROM_NUMBER</label><input id="s-TWILIO_FROM_NUMBER" />
+      <button class="btn sm" onclick="saveGroup('twilio')">Save Twilio</button>
+
+      <div class="group-title">S3 Recordings</div>
+      <label>S3_ACCESS_KEY_ID</label><input id="s-S3_ACCESS_KEY_ID" />
+      <label>S3_SECRET_ACCESS_KEY <span class="eye-toggle" onclick="toggleEye('s-S3_SECRET_ACCESS_KEY')">👁</span></label><input id="s-S3_SECRET_ACCESS_KEY" type="password" />
+      <label>S3_ENDPOINT_URL</label><input id="s-S3_ENDPOINT_URL" />
+      <label>S3_REGION</label><input id="s-S3_REGION" value="ap-northeast-1" />
+      <label>S3_BUCKET</label><input id="s-S3_BUCKET" />
+      <button class="btn sm" onclick="saveGroup('s3')">Save S3</button>
+
+      <div class="group-title">Cal.com</div>
+      <label>CALCOM_API_KEY <span class="eye-toggle" onclick="toggleEye('s-CALCOM_API_KEY')">👁</span></label><input id="s-CALCOM_API_KEY" type="password" />
+      <label>CALCOM_EVENT_TYPE_ID</label><input id="s-CALCOM_EVENT_TYPE_ID" />
+      <label>CALCOM_TIMEZONE</label><input id="s-CALCOM_TIMEZONE" value="Asia/Kolkata" />
+      <button class="btn sm" onclick="saveGroup('calcom')">Save Cal.com</button>
+
+      <div class="group-title">Tool Toggles</div>
+      <div id="tool-toggles"></div>
+      <button class="btn sm" onclick="saveToolToggles()">Save Tools</button>
+    </div>
+  </section>
+
+  <!-- LOGS -->
+  <section id="panel-logs" class="panel">
+    <div class="card">
+      <div class="flex-between">
+        <h2>Live Logs</h2>
+        <div class="flex">
+          <select id="log-level" style="width:auto"><option value="">All levels</option><option value="info">info</option><option value="warning">warning</option><option value="error">error</option></select>
+          <select id="log-source" style="width:auto"><option value="">All sources</option><option value="agent">agent</option><option value="server">server</option></select>
+          <button class="btn secondary sm" id="log-pause">Pause</button>
+          <button class="btn danger sm" onclick="clearLogs()">Clear</button>
+        </div>
+      </div>
+      <div id="log-viewer" style="max-height:500px;overflow-y:auto;margin-top:12px"></div>
+    </div>
+  </section>
+
+  <!-- SETUP -->
+  <section id="panel-setup" class="panel">
+    <div class="grid grid-2">
+      <div class="card">
+        <h2>Quick Start</h2>
+        <div class="setup-step"><strong>1.</strong> Run <code>supabase_schema.sql</code> in Supabase SQL Editor</div>
+        <div class="setup-step"><strong>2.</strong> Go to Settings → fill LiveKit, Gemini, Vobiz credentials</div>
+        <div class="setup-step"><strong>3.</strong> Click ⚡ Create SIP Trunk in LiveKit</div>
+        <div class="setup-step"><strong>4.</strong> Customize AI Prompt for your business</div>
+        <div class="setup-step"><strong>5.</strong> Create an Agent Profile</div>
+        <div class="setup-step"><strong>6.</strong> Test with Single Call to your own number</div>
+      </div>
+      <div class="card">
+        <h2>Cost Breakdown (per minute)</h2>
+        <table class="cost-table">
+          <tr><td>Vobiz SIP</td><td>₹1.00</td></tr>
+          <tr><td>LiveKit Cloud</td><td>₹0.17</td></tr>
+          <tr><td>Gemini Live</td><td>₹0.03</td></tr>
+          <tr><td><strong>Total (realtime)</strong></td><td><strong>≈ ₹1.20</strong></td></tr>
+        </table>
+        <p style="margin-top:12px;color:var(--text2);font-size:12px">A typical 2-minute call costs ≈ ₹2.40</p>
+      </div>
+    </div>
+  </section>
+</main>
+<div id="toast-container"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const api = (path, opts) => fetch(path, opts).then(r => { if(!r.ok) return r.json().then(e=>Promise.reject(e)); return r.json(); });
+const apiPost = (path, body) => api(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+const apiPut = (path, body) => api(path, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+const apiPatch = (path, body) => api(path, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+const apiDel = path => api(path, {method:'DELETE'});
+
+const VOICE_HTML = `<optgroup label="Female voices">
+<option value="Aoede">Aoede — warm, expressive ⭐</option>
+<option value="Achernar">Achernar — soft & clear</option>
+<option value="Autonoe">Autonoe — natural female</option>
+<option value="Callirrhoe">Callirrhoe — gentle female</option>
+<option value="Despina">Despina — bright female</option>
+<option value="Erinome">Erinome — smooth female</option>
+<option value="Gacrux">Gacrux — rich female</option>
+<option value="Kore">Kore — soft, calm</option>
+<option value="Laomedeia">Laomedeia — light female</option>
+<option value="Leda">Leda — clear female</option>
+<option value="Pulcherrima">Pulcherrima — warm female</option>
+<option value="Sulafat">Sulafat — smooth female</option>
+<option value="Vindemiatrix">Vindemiatrix — professional female</option>
+<option value="Zephyr">Zephyr — airy female</option>
+</optgroup>
+<optgroup label="Male voices">
+<option value="Achird">Achird — clear male</option>
+<option value="Algenib">Algenib — strong male</option>
+<option value="Algieba">Algieba — rich male</option>
+<option value="Alnilam">Alnilam — deep male</option>
+<option value="Charon">Charon — calm, deep</option>
+<option value="Enceladus">Enceladus — expressive male</option>
+<option value="Fenrir">Fenrir — confident male</option>
+<option value="Iapetus">Iapetus — steady male</option>
+<option value="Orus">Orus — warm male</option>
+<option value="Perseus">Perseus — clear male</option>
+<option value="Puck">Puck — bright, energetic</option>
+<option value="Rasalgethi">Rasalgethi — bold male</option>
+<option value="Sadachbia">Sadachbia — natural male</option>
+<option value="Sadaltager">Sadaltager — smooth male</option>
+<option value="Schedar">Schedar — professional male</option>
+<option value="Umbriel">Umbriel — deep, calm</option>
+<option value="Zubenelgenubi">Zubenelgenubi — resonant male</option>
+</optgroup>`;
+
+const ALL_TOOLS = ['check_availability','book_appointment','end_call','transfer_to_human','send_sms_confirmation','lookup_contact','remember_details','book_calcom','cancel_calcom'];
+let _charts = {};
+let _callsPage = 1;
+let _batchContacts = [];
+let _campContacts = [];
+let _logsPaused = false;
+let _logsTimer = null;
+let _agentProfiles = [];
+
+function toast(msg, type='ok') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + (type === 'ok' ? 'ok' : 'err');
+  el.textContent = msg;
+  $('toast-container').appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+function showErr(id, msg) { const e = $(id); if(e) e.textContent = msg || ''; }
+
+function switchTab(name) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  const panel = $('panel-' + name);
+  if (panel) panel.classList.add('active');
+  document.querySelector(`nav button[data-tab="${name}"]`)?.classList.add('active');
+  if (name === 'stats') { loadStats(); loadLiveConfig(); }
+  if (name === 'campaigns') loadCampaigns();
+  if (name === 'agents') loadAgentProfiles();
+  if (name === 'prompt') loadPrompt();
+  if (name === 'appointments') loadAppointments();
+  if (name === 'calls') loadCalls();
+  if (name === 'crm') loadCRM();
+  if (name === 'settings') loadSettings();
+  if (name === 'logs') loadLogs();
+}
+
+document.querySelectorAll('nav button').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
+
+function _mkChart(id, type, data, options) {
+  if (_charts[id]) { _charts[id].destroy(); }
+  const ctx = $(id)?.getContext('2d');
+  if (!ctx) return;
+  _charts[id] = new Chart(ctx, { type, data, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#aaa' } } }, scales: type !== 'doughnut' ? { x: { ticks: { color: '#aaa' }, grid: { color: '#252525' } }, y: { ticks: { color: '#aaa' }, grid: { color: '#252525' } } } : {}, ...options } });
+}
+
+function _renderCharts(d) {
+  const outcomes = d.outcomes || {};
+  _mkChart('chart-outcomes', 'doughnut', {
+    labels: Object.keys(outcomes),
+    datasets: [{ data: Object.values(outcomes), backgroundColor: ['#00ff88','#ff4d4d','#ffaa00','#00ccff','#5a5a5a','#e0e0e0'] }]
+  });
+  const tl = d.timeline || [];
+  _mkChart('chart-timeline', 'line', {
+    labels: tl.map(t => t.date.slice(5)),
+    datasets: [{ label: 'Calls', data: tl.map(t => t.count), borderColor: '#00ccff', backgroundColor: '#00ccff33', fill: true, tension: 0.3 }]
+  });
+  const dur = d.duration_by_outcome || {};
+  _mkChart('chart-duration', 'bar', {
+    labels: Object.keys(dur),
+    datasets: [{ label: 'Seconds', data: Object.values(dur), backgroundColor: '#00ff88' }]
+  });
+}
+
+async function loadStats() {
+  try {
+    const d = await api('/api/stats');
+    $('kpi-total').textContent = d.total_calls;
+    $('kpi-booked').textContent = d.booked;
+    $('kpi-not').textContent = d.not_interested;
+    $('kpi-rate').textContent = d.booking_rate_percent + '%';
+    $('kpi-dur').textContent = d.avg_duration_seconds;
+    _renderCharts(d);
+  } catch(e) { toast('Failed to load stats', 'err'); }
+}
+
+async function loadLiveConfig() {
+  try {
+    const [settings, prompt] = await Promise.all([api('/api/settings'), api('/api/prompt')]);
+    const chips = [];
+    const check = (k, label) => chips.push(`<span class="chip ${settings[k]?.configured ? 'ok' : 'no'}">${label}</span>`);
+    check('LIVEKIT_URL', 'LiveKit');
+    check('GOOGLE_API_KEY', 'Gemini');
+    check('VOBIZ_SIP_DOMAIN', 'Vobiz');
+    check('SUPABASE_URL', 'Supabase');
+    check('OUTBOUND_TRUNK_ID', 'SIP Trunk');
+    const model = settings.GEMINI_MODEL?.value || '—';
+    const voice = settings.GEMINI_TTS_VOICE?.value || 'Aoede';
+    chips.push(`<span class="chip ok">${model}</span>`);
+    chips.push(`<span class="chip ok">${voice}</span>`);
+    $('live-config').innerHTML = chips.join(' ');
+  } catch(e) { $('live-config').textContent = 'Config unavailable'; }
+}
+
+function parseCSV(text) {
+  const lines = text.trim().split(/\r?\n/);
+  const headers = lines[0].split(',').map(h => h.trim().toLowerCase().replace(/"/g,''));
+  return lines.slice(1).filter(l => l.trim()).map(line => {
+    const vals = line.match(/(".*?"|[^",]+)(?=\s*,|\s*$)/g) || line.split(',');
+    const obj = {};
+    headers.forEach((h, i) => obj[h] = (vals[i] || '').replace(/"/g,'').trim());
+    if (!obj.phone && obj.phonenumber) obj.phone = obj.phonenumber;
+    return obj;
+  }).filter(r => r.phone);
+}
+
+function renderPreview(contacts, elId) {
+  if (!contacts.length) { $(elId).innerHTML = '<p style="color:var(--text2)">No contacts parsed</p>'; return; }
+  let html = '<table><tr><th>Phone</th><th>Lead</th><th>Business</th><th>Service</th></tr>';
+  contacts.slice(0, 20).forEach(c => {
+    html += `<tr><td>${c.phone}</td><td>${c.lead_name||'—'}</td><td>${c.business_name||'—'}</td><td>${c.service_type||'—'}</td></tr>`;
+  });
+  if (contacts.length > 20) html += `<tr><td colspan="4" style="color:var(--text2)">…and ${contacts.length-20} more</td></tr>`;
+  html += '</table>';
+  $(elId).innerHTML = html;
+}
+
+function populateAgentDropdowns() {
+  const opts = '<option value="">— Default —</option>' + _agentProfiles.map(p =>
+    `<option value="${p.id}">${p.name}${p.is_default ? ' ★' : ''}</option>`).join('');
+  ['sc-agent-profile','bc-agent-profile','camp-agent-profile'].forEach(id => { if($(id)) $(id).innerHTML = opts; });
+}
+
+async function loadAgentProfiles() {
+  try {
+    const raw = await api('/api/agent-profiles');
+    _agentProfiles = Array.isArray(raw) ? raw : [];
+    populateAgentDropdowns();
+    if (!_agentProfiles.length) { $('agent-list').innerHTML = '<p style="color:var(--text2)">No profiles yet. Create one above.</p>'; return; }
+    let html = '<table><tr><th>Name</th><th>Voice</th><th>Model</th><th>Default</th><th>Actions</th></tr>';
+    _agentProfiles.forEach(p => {
+      html += `<tr><td>${p.name}</td><td>${p.voice}</td><td style="font-size:11px">${p.model}</td><td>${p.is_default ? '★' : ''}</td>
+        <td><button class="btn sm secondary" onclick="editAgentProfile('${p.id}')">Edit</button>
+        ${!p.is_default ? `<button class="btn sm" onclick="setDefaultAgentProfile('${p.id}','${p.name}')">★ Default</button>` : ''}
+        <button class="btn sm danger" onclick="deleteAgentProfile('${p.id}','${p.name}')">Delete</button></td></tr>`;
+    });
+    html += '</table>';
+    $('agent-list').innerHTML = html;
+  } catch(e) { $('agent-list').innerHTML = '<p class="err">Failed to load profiles. Run supabase_schema.sql first.</p>'; }
+}
+
+window.saveAgentProfile = async () => {
+  const body = {
+    name: $('agent-name').value,
+    voice: $('agent-voice').value,
+    model: $('agent-model').value,
+    system_prompt: $('agent-prompt').value || null,
+    enabled_tools: $('agent-tools').value || '[]',
+    is_default: $('agent-default').checked,
+  };
+  if (!body.name) { toast('Name required', 'err'); return; }
+  try {
+    const editId = $('agent-edit-id').value;
+    if (editId) { await apiPut(`/api/agent-profiles/${editId}`, body); toast('Profile updated'); }
+    else { await apiPost('/api/agent-profiles', body); toast('Profile created'); }
+    resetAgentForm();
+    loadAgentProfiles();
+  } catch(e) { toast(e.detail || 'Save failed', 'err'); }
+};
+
+window.editAgentProfile = async (id) => {
+  const p = await api(`/api/agent-profiles/${id}`);
+  $('agent-edit-id').value = id;
+  $('agent-form-title').textContent = 'Edit Agent Profile';
+  $('agent-name').value = p.name;
+  $('agent-voice').value = p.voice;
+  $('agent-model').value = p.model;
+  $('agent-prompt').value = p.system_prompt || '';
+  $('agent-tools').value = p.enabled_tools || '[]';
+  $('agent-default').checked = !!p.is_default;
+};
+
+window.deleteAgentProfile = async (id, name) => {
+  if (!confirm(`Delete profile "${name}"?`)) return;
+  await apiDel(`/api/agent-profiles/${id}`);
+  toast('Deleted'); loadAgentProfiles();
+};
+
+window.setDefaultAgentProfile = async (id, name) => {
+  await apiPost(`/api/agent-profiles/${id}/set-default`, {});
+  toast(`${name} is now default`); loadAgentProfiles();
+};
+
+window.resetAgentForm = () => {
+  $('agent-edit-id').value = '';
+  $('agent-form-title').textContent = 'Create Agent Profile';
+  $('agent-name').value = '';
+  $('agent-voice').value = 'Aoede';
+  $('agent-model').value = 'gemini-3.1-flash-live-preview';
+  $('agent-prompt').value = '';
+  $('agent-tools').value = '[]';
+  $('agent-default').checked = false;
+};
+
+async function loadPrompt() {
+  const d = await api('/api/prompt');
+  $('prompt-text').value = d.prompt;
+  $('prompt-count').textContent = d.prompt.length + ' chars' + (d.is_custom ? ' (custom)' : ' (default)');
+}
+window.savePrompt = async () => {
+  await apiPost('/api/prompt', { prompt: $('prompt-text').value });
+  toast('Prompt saved'); loadPrompt();
+};
+window.resetPrompt = async () => {
+  const d = await apiDel('/api/prompt');
+  $('prompt-text').value = d.prompt;
+  toast('Reset to default'); loadPrompt();
+};
+$('prompt-text')?.addEventListener('input', () => { $('prompt-count').textContent = $('prompt-text').value.length + ' chars'; });
+
+async function loadAppointments() {
+  const date = $('appt-date')?.value || '';
+  const rows = await api('/api/appointments' + (date ? `?date=${date}` : ''));
+  if (!rows.length) { $('appt-list').innerHTML = '<p style="color:var(--text2)">No appointments</p>'; return; }
+  let html = '<table><tr><th>Name</th><th>Phone</th><th>Date</th><th>Time</th><th>Service</th><th>Status</th><th></th></tr>';
+  rows.forEach(a => {
+    html += `<tr><td>${a.name}</td><td>${a.phone}</td><td>${a.date}</td><td>${a.time}</td><td>${a.service}</td>
+      <td><span class="badge ${a.status}">${a.status}</span></td>
+      <td>${a.status==='booked' ? `<button class="btn sm danger" onclick="cancelAppointment('${a.id}')">Cancel</button>` : ''}</td></tr>`;
+  });
+  html += '</table>';
+  $('appt-list').innerHTML = html;
+}
+window.cancelAppointment = async (id) => {
+  if (!confirm('Cancel this appointment?')) return;
+  await apiDel(`/api/appointments/${id}`);
+  toast('Cancelled'); loadAppointments();
+};
+$('appt-date')?.addEventListener('change', loadAppointments);
+
+let _callsData = [];
+async function loadCalls(page = 1) {
+  _callsPage = page;
+  _callsData = await api(`/api/calls?page=${page}&limit=20`);
+  $('calls-page').textContent = `Page ${page}`;
+  if (!_callsData.length) { $('calls-list').innerHTML = '<p style="color:var(--text2)">No calls yet</p>'; return; }
+  let html = '<table><tr><th>Phone</th><th>Lead</th><th>Outcome</th><th>Duration</th><th>Time</th><th>Recording</th><th>Notes</th></tr>';
+  _callsData.forEach(c => {
+    html += `<tr><td>${c.phone_number}</td><td>${c.lead_name||'—'}</td>
+      <td><span class="badge ${c.outcome||''}">${c.outcome||'—'}</span></td>
+      <td>${c.duration_seconds||0}s</td><td style="font-size:11px">${(c.timestamp||'').slice(0,16)}</td>
+      <td>${c.recording_url ? `<a href="${c.recording_url}" target="_blank" style="color:var(--accent2)">🎧</a>` : '—'}</td>
+      <td><textarea class="notes-input" id="notes-${c.id}">${c.notes||''}</textarea>
+        <button class="btn sm" onclick="saveNotes('${c.id}')">Save</button></td></tr>`;
+  });
+  html += '</table>';
+  $('calls-list').innerHTML = html;
+}
+window.saveNotes = async (callId) => {
+  const notes = $(`notes-${callId}`).value;
+  await apiPatch(`/api/calls/${callId}/notes`, { notes });
+  toast('Notes saved');
+};
+$('calls-prev')?.addEventListener('click', () => { if (_callsPage > 1) loadCalls(_callsPage - 1); });
+$('calls-next')?.addEventListener('click', () => loadCalls(_callsPage + 1));
+
+async function loadCRM() {
+  const { data } = await api('/api/crm');
+  if (!data.length) { $('crm-list').innerHTML = '<p style="color:var(--text2)">No contacts yet</p>'; return; }
+  let html = '<table><tr><th>Phone</th><th>Name</th><th>Calls</th><th>Booked</th><th>Last Call</th><th>Last Outcome</th></tr>';
+  data.forEach(c => {
+    html += `<tr style="cursor:pointer" onclick="loadContactDetail('${c.phone_number}')">
+      <td>${c.phone_number}</td><td>${c.lead_name||'—'}</td><td>${c.total_calls}</td><td>${c.booked}</td>
+      <td style="font-size:11px">${(c.last_call||'').slice(0,16)}</td>
+      <td><span class="badge ${c.last_outcome||''}">${c.last_outcome||'—'}</span></td></tr>`;
+  });
+  html += '</table>';
+  $('crm-list').innerHTML = html;
+}
+window.loadContactDetail = async (phone) => {
+  const { data } = await api(`/api/crm/calls?phone=${encodeURIComponent(phone)}`);
+  let html = `<h3 style="color:var(--accent)">${phone}</h3><table><tr><th>Outcome</th><th>Reason</th><th>Duration</th><th>Time</th></tr>`;
+  data.forEach(c => {
+    html += `<tr><td><span class="badge ${c.outcome||''}">${c.outcome||'—'}</span></td><td>${c.reason||''}</td><td>${c.duration_seconds||0}s</td><td>${(c.timestamp||'').slice(0,16)}</td></tr>`;
+  });
+  html += '</table>';
+  $('crm-detail').innerHTML = html;
+  $('crm-detail').classList.remove('hidden');
+};
+
+const GROUPS = {
+  livekit: ['LIVEKIT_URL','LIVEKIT_API_KEY','LIVEKIT_API_SECRET'],
+  gemini: ['GOOGLE_API_KEY','GEMINI_MODEL','GEMINI_TTS_VOICE','USE_GEMINI_REALTIME'],
+  vobiz: ['VOBIZ_SIP_DOMAIN','VOBIZ_USERNAME','VOBIZ_PASSWORD','VOBIZ_OUTBOUND_NUMBER','OUTBOUND_TRUNK_ID','DEFAULT_TRANSFER_NUMBER'],
+  twilio: ['TWILIO_ACCOUNT_SID','TWILIO_AUTH_TOKEN','TWILIO_FROM_NUMBER'],
+  s3: ['S3_ACCESS_KEY_ID','S3_SECRET_ACCESS_KEY','S3_ENDPOINT_URL','S3_REGION','S3_BUCKET'],
+  calcom: ['CALCOM_API_KEY','CALCOM_EVENT_TYPE_ID','CALCOM_TIMEZONE'],
+};
+
+async function loadSettings() {
+  const s = await api('/api/settings');
+  Object.keys(s).forEach(k => {
+    const el = $('s-' + k);
+    if (el && s[k].value) el.value = s[k].value;
+    else if (el && s[k].configured) el.placeholder = '•••••••• (configured)';
+  });
+  const toggles = $('tool-toggles');
+  let enabled = [];
+  try { enabled = JSON.parse(s.ENABLED_TOOLS?.value || '[]'); } catch(e) {}
+  toggles.innerHTML = ALL_TOOLS.map(t =>
+    `<label style="display:inline-block;margin-right:12px"><input type="checkbox" class="tool-cb" value="${t}" ${!enabled.length || enabled.includes(t) ? 'checked' : ''}/> ${t}</label>`
+  ).join('');
+}
+
+window.saveGroup = async (group) => {
+  const settings = {};
+  (GROUPS[group] || []).forEach(k => { const v = $('s-'+k)?.value; if (v) settings[k] = v; });
+  await apiPost('/api/settings', { settings });
+  toast(`${group} settings saved`);
+};
+
+window.createSIPTrunk = async () => {
+  try {
+    const r = await apiPost('/api/setup/trunk', {});
+    toast(`Trunk created: ${r.trunk_id}`);
+    $('s-OUTBOUND_TRUNK_ID').value = r.trunk_id;
+  } catch(e) { toast(e.detail || 'Trunk creation failed', 'err'); }
+};
+
+window.saveToolToggles = async () => {
+  const enabled = [...document.querySelectorAll('.tool-cb:checked')].map(cb => cb.value);
+  await apiPost('/api/settings', { settings: { ENABLED_TOOLS: JSON.stringify(enabled) } });
+  toast('Tool toggles saved');
+};
+
+window.toggleEye = (id) => { const el = $(id); if(el) el.type = el.type === 'password' ? 'text' : 'password'; };
+
+async function loadLogs() {
+  const level = $('log-level')?.value || '';
+  const source = $('log-source')?.value || '';
+  let url = '/api/logs?limit=200';
+  if (level) url += `&level=${level}`;
+  if (source) url += `&source=${source}`;
+  const rows = await api(url);
+  $('log-viewer').innerHTML = rows.map(r =>
+    `<div class="log-entry ${r.level}"><span class="ts">${(r.timestamp||'').slice(11,19)}</span> [${r.source}] <span class="msg">${r.message}</span>${r.detail ? ' — '+r.detail : ''}</div>`
+  ).join('') || '<p style="color:var(--text2)">No logs</p>';
+}
+window.clearLogs = async () => { await apiDel('/api/logs'); toast('Logs cleared'); loadLogs(); };
+function scheduleLogsRefresh() {
+  if (_logsTimer) clearInterval(_logsTimer);
+  _logsTimer = setInterval(() => { if (!_logsPaused && $('panel-logs')?.classList.contains('active')) loadLogs(); }, 5000);
+}
+$('log-pause')?.addEventListener('click', () => {
+  _logsPaused = !_logsPaused;
+  $('log-pause').textContent = _logsPaused ? 'Resume' : 'Pause';
+});
+$('log-level')?.addEventListener('change', loadLogs);
+$('log-source')?.addEventListener('change', loadLogs);
+
+async function loadCampaigns() {
+  const camps = await api('/api/campaigns');
+  if (!camps.length) { $('camp-list').innerHTML = '<p style="color:var(--text2)">No campaigns</p>'; return; }
+  let html = '<table><tr><th>Name</th><th>Schedule</th><th>Status</th><th>Dispatched</th><th>Failed</th><th>Last Run</th><th>Actions</th></tr>';
+  camps.forEach(c => {
+    const newStatus = c.status === 'active' ? 'paused' : 'active';
+    html += `<tr><td>${c.name}</td><td>${c.schedule_type} ${c.schedule_time||''}</td>
+      <td><span class="badge ${c.status}">${c.status}</span></td>
+      <td>${c.total_dispatched||0}</td><td>${c.total_failed||0}</td>
+      <td style="font-size:11px">${(c.last_run_at||'—').slice(0,16)}</td>
+      <td><button class="btn sm" onclick="runCampaign('${c.id}','${c.name}')">Run</button>
+        <button class="btn sm secondary" onclick="toggleCampaignStatus('${c.id}','${newStatus}')">${c.status==='active'?'Pause':'Resume'}</button>
+        <button class="btn sm danger" onclick="deleteCampaign('${c.id}','${c.name}')">Delete</button></td></tr>`;
+  });
+  html += '</table>';
+  $('camp-list').innerHTML = html;
+}
+window.runCampaign = async (id, name) => {
+  await apiPost(`/api/campaigns/${id}/run`, {});
+  toast(`Campaign "${name}" dispatching`);
+};
+window.toggleCampaignStatus = async (id, newStatus) => {
+  await apiPatch(`/api/campaigns/${id}/status`, { status: newStatus });
+  toast(`Status: ${newStatus}`); loadCampaigns();
+};
+window.deleteCampaign = async (id, name) => {
+  if (!confirm(`Delete campaign "${name}"?`)) return;
+  await apiDel(`/api/campaigns/${id}`);
+  toast('Deleted'); loadCampaigns();
+};
+
+$('camp-create')?.addEventListener('click', async () => {
+  showErr('camp-err', '');
+  if (!_campContacts.length) { showErr('camp-err', 'Parse CSV first'); return; }
+  const body = {
+    name: $('camp-name').value,
+    contacts: _campContacts,
+    schedule_type: $('camp-schedule').value,
+    schedule_time: $('camp-time').value || '09:00',
+    call_delay_seconds: parseInt($('camp-delay').value) || 3,
+    agent_profile_id: $('camp-agent-profile').value || null,
+  };
+  if ($('camp-custom-prompt-cb').checked) body.system_prompt = $('camp-prompt').value;
+  if (!body.name) { showErr('camp-err', 'Name required'); return; }
+  try {
+    const r = await apiPost('/api/campaigns', body);
+    toast(`Campaign created: ${r.campaign_id}`);
+    _campContacts = [];
+    $('camp-preview').innerHTML = '';
+    loadCampaigns();
+  } catch(e) { showErr('camp-err', e.detail || 'Failed'); }
+});
+
+$('call-form')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  showErr('sc-err', '');
+  const body = {
+    phone: $('sc-phone').value.trim(),
+    lead_name: $('sc-lead').value,
+    business_name: $('sc-biz').value,
+    service_type: $('sc-service').value,
+    agent_profile_id: $('sc-agent-profile').value || null,
+  };
+  if ($('sc-custom-prompt-cb').checked) body.system_prompt = $('sc-prompt').value;
+  try {
+    const r = await apiPost('/api/call', body);
+    toast(`Call dispatched to ${r.phone} (room: ${r.room})`);
+  } catch(e) { showErr('sc-err', e.detail || 'Dispatch failed'); }
+});
+
+$('sc-custom-prompt-cb')?.addEventListener('change', () => $('sc-prompt').classList.toggle('hidden', !$('sc-custom-prompt-cb').checked));
+$('camp-custom-prompt-cb')?.addEventListener('change', () => $('camp-prompt').classList.toggle('hidden', !$('camp-custom-prompt-cb').checked));
+
+$('bc-parse')?.addEventListener('click', () => {
+  const file = $('bc-csv').files[0];
+  if (!file) { showErr('bc-err', 'Select a CSV file'); return; }
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    _batchContacts = parseCSV(e.target.result);
+    renderPreview(_batchContacts, 'bc-preview');
+    $('bc-start').classList.toggle('hidden', !_batchContacts.length);
+    showErr('bc-err', '');
+  };
+  reader.readAsText(file);
+});
+
+$('bc-start')?.addEventListener('click', async () => {
+  if (!_batchContacts.length) return;
+  const delay = parseInt($('bc-delay').value) || 3;
+  const profileId = $('bc-agent-profile').value || null;
+  $('bc-progress-wrap').classList.remove('hidden');
+  let done = 0;
+  for (const c of _batchContacts) {
+    try {
+      const body = {
+        phone: c.phone, lead_name: c.lead_name || 'there',
+        business_name: c.business_name || 'our company',
+        service_type: c.service_type || 'our service',
+        agent_profile_id: profileId,
+      };
+      await apiPost('/api/call', body);
+    } catch(e) { console.error(e); }
+    done++;
+    $('bc-progress').style.width = Math.round(done / _batchContacts.length * 100) + '%';
+    if (done < _batchContacts.length) await new Promise(r => setTimeout(r, delay * 1000));
+  }
+  toast(`Batch complete: ${done} calls dispatched`);
+});
+
+$('camp-parse')?.addEventListener('click', () => {
+  const file = $('camp-csv').files[0];
+  if (!file) { showErr('camp-err', 'Select a CSV file'); return; }
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    _campContacts = parseCSV(e.target.result);
+    renderPreview(_campContacts, 'camp-preview');
+    showErr('camp-err', '');
+  };
+  reader.readAsText(file);
+});
+
+function init() {
+  $('agent-voice').innerHTML = VOICE_HTML;
+  $('s-GEMINI_TTS_VOICE').innerHTML = VOICE_HTML;
+  loadStats();
+  loadCalls();
+  loadAppointments();
+  loadLogs();
+  loadAgentProfiles();
+  setInterval(loadStats, 10000);
+  scheduleLogsRefresh();
+}
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>

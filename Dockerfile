@@ -1,23 +1,23 @@
 FROM python:3.11-slim
 
-WORKDIR /app
-
-# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
+        libgomp1 \
+        libglib2.0-0 \
+        libsndfile1 \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
+WORKDIR /app
+
 COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
 
-# Install python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy source code
 COPY . .
 
-# Expose port (if needed, e.g. for healthchecks)
-EXPOSE 8080
+RUN mkdir -p /data
+ENV DB_PATH=/data/appointments.db
 
-# Run the agent
-CMD ["python", "agent.py", "start"]
+EXPOSE 8000
+
+CMD ["sh", "start.sh"]

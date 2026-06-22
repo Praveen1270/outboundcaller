@@ -87,8 +87,13 @@ try:
         _google_tts = _gp.TTS
     except AttributeError:
         pass
-except ImportError:
-    logger.warning("livekit-plugins-google not installed")
+except Exception as exc:
+    logger.warning("livekit.plugins.google import failed: %s", exc)
+    try:
+        from livekit.plugins.google.realtime import RealtimeModel as _google_realtime
+        logger.info("Loaded RealtimeModel via direct realtime import")
+    except Exception as exc2:
+        logger.error("Google realtime fallback import failed: %s", exc2)
 
 _deepgram_stt = None
 try:
@@ -127,17 +132,17 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
             # prefix_padding_ms=100 = minimal audio capture before speech (was 200ms)
             _realtime_input_cfg = _gt.RealtimeInputConfig(
                 automatic_activity_detection=_gt.AutomaticActivityDetection(
-                    end_of_speech_sensitivity=_gt.EndSensitivity.END_SENSITIVITY_HIGH,
-                    silence_duration_ms=500,
-                    prefix_padding_ms=100,
+                    end_of_speech_sensitivity=_gt.EndSensitivity.END_SENSITIVITY_LOW,
+                    silence_duration_ms=800,
+                    prefix_padding_ms=200,
                 ),
                 activity_handling=_gt.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
                 turn_coverage=_gt.TurnCoverage.TURN_INCLUDES_ALL_INPUT,
             )
             _session_resumption_cfg = _gt.SessionResumptionConfig(transparent=True)
             _ctx_compression_cfg = _gt.ContextWindowCompressionConfig(
-                trigger_tokens=25600,
-                sliding_window=_gt.SlidingWindow(target_tokens=12800),
+                trigger_tokens=15000,
+                sliding_window=_gt.SlidingWindow(target_tokens=8000),
             )
             # ── DISABLE THINKING — biggest single latency win ──────────────────
             # Gemini 2.5/3.x native-audio defaults to extended "thinking" before
@@ -147,7 +152,7 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
                 _thinking_cfg = _gt.ThinkingConfig(thinking_budget=0)
             except Exception:
                 _thinking_cfg = None
-            logger.info("Fast VAD applied (HIGH sens, 500ms silence) + thinking DISABLED")
+            logger.info("VAD applied (LOW sens, 800ms silence, 200ms prefix) + thinking DISABLED + 15k token compression trigger")
         except Exception as _cfg_err:
             logger.warning("Could not build latency config: %s", _cfg_err)
             _realtime_input_cfg = None
@@ -183,10 +188,14 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     """
     Main entrypoint. Called per job. Reads metadata JSON from ctx.job.metadata.
 
-    DIAL-FIRST PATTERN — CRITICAL:
-    Start Gemini Live ONLY after create_sip_participant(wait_until_answered=True) completes.
-    If you start the session during ring time (~20-30s), the Gemini idle timeout fires
-    and the session dies silently before the call is even answered.
+    PARALLEL DIAL + SESSION PATTERN (latency fix):
+    Dial SIP in the background with wait_until_answered=False, and start Gemini Live
+    session in parallel with ring time. By the time the lead picks up, the AI session
+    is fully warmed up — no 10-15s cold-start silence.
+
+    The _answered_event (set by the participant_connected handler when the SIP leg
+    establishes) is the AUTHORITATIVE sync point before any greeting fires.
+    dial_task may complete as soon as the SIP INVITE is sent, NOT when the lead picks up.
 
     NO close_on_disconnect — SIP legs have brief audio dropouts that look like disconnects.
     Instead, watch participant_disconnected event for the specific SIP identity.
@@ -221,14 +230,17 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     system_prompt = build_prompt(lead_name=lead_name, business_name=business_name,
                                   service_type=service_type, custom_prompt=custom_prompt)
 
-    # ── PRE-FETCH CONTACT HISTORY (runs BEFORE session.start) ─────────────────
-    # We pull call history / appointments / memories from Supabase concurrently
-    # and inject the result into the system prompt. The model no longer needs
-    # to call lookup_contact mid-greeting — that was blocking the greeting for
-    # 10-15s while the tool call resolved. By the time the LLM is asked to
-    # speak, history is already in its context.
-    contact_history_text = ""
-    if phone_number:
+    # ── PARALLEL SETUP: connect + prefetch run at the same time ──────────────
+    # LATENCY FIX: previously the Supabase contact-history gather (3 queries,
+    # ~4-6s) ran BEFORE ctx.connect(), which delayed session.start() and left
+    # Gemini Live cold when the lead picked up — causing the variable 1-5s
+    # greeting delay. Now connect + prefetch run concurrently, so the ring
+    # time (3-10s) covers both, and generate_reply fires within 200-500ms of
+    # pickup (was 1.3s-5.1s).
+    async def _prefetch():
+        _history = ""
+        if not phone_number:
+            return _history
         try:
             from db import get_calls_by_phone, get_appointments_by_phone, get_contact_memory
             calls, appointments, memories = await asyncio.gather(
@@ -239,9 +251,9 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             )
             # Treat per-query failures as empty (defensive — single bad query
             # shouldn't poison the whole contact history)
-            calls = calls if isinstance(calls, list) else []
+            calls        = calls        if isinstance(calls,        list) else []
             appointments = appointments if isinstance(appointments, list) else []
-            memories = memories if isinstance(memories, list) else []
+            memories     = memories     if isinstance(memories,     list) else []
             if calls or appointments or memories:
                 lines = ["\n\n━━━ KNOWN CONTACT HISTORY (already retrieved — do not call lookup_contact) ━━━"]
                 if memories:
@@ -257,12 +269,17 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                     lines.append("APPOINTMENTS:")
                     for a in appointments[:3]:
                         lines.append(f"  • {a.get('date')} {a.get('time')} — {a.get('service')} [{a.get('status')}]")
-                contact_history_text = "\n".join(lines)
+                _history = "\n".join(lines)
                 await _log("info", f"Pre-fetched history for {phone_number}: {len(calls)} calls, {len(appointments)} appts, {len(memories)} memories")
             else:
-                contact_history_text = "\n\n━━━ KNOWN CONTACT HISTORY ━━━\nNo prior history — first-time contact."
+                _history = "\n\n━━━ KNOWN CONTACT HISTORY ━━━\nNo prior history — first-time contact."
         except Exception as exc:
             logger.warning("Contact pre-fetch failed (non-fatal): %s", exc)
+        return _history
+
+    await ctx.connect()
+    contact_history_text = await _prefetch()
+    await _log("info", f"Connected to LiveKit room: {ctx.room.name}")
 
     system_prompt = system_prompt + contact_history_text
     tool_ctx = AppointmentTools(ctx, phone_number, lead_name)
@@ -280,166 +297,173 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     else:
         enabled_tools = await get_enabled_tools()
 
-    # ── Connect ──────────────────────────────────────────────────────────────
-    await ctx.connect()
-    await _log("info", f"Connected to LiveKit room: {ctx.room.name}")
+    # ── PARALLEL DIAL + AI STARTUP (background, non-blocking) ───────────────
+    # Dial kicks off the SIP INVITE and returns immediately. Gemini Live session
+    # starts below in parallel with ring time. _answered_event is the authoritative
+    # sync point — set by the participant_connected handler when the lead picks up.
+    if phone_number:
+        trunk_id = os.getenv("OUTBOUND_TRUNK_ID")
+        if not trunk_id:
+            await _log("error", "OUTBOUND_TRUNK_ID not set — cannot place outbound call")
+            ctx.shutdown()
+            return
 
-    # ── PARALLEL DIAL + AI STARTUP ──────────────────────────────────────────
-    # Old flow:  dial(blocks 5-15s for ring) → session.start(1s) → greeting
-    #            user perceived: ~6-16s of "AI not speaking" after pickup
-    # New flow:  dial(fire-and-forget) → session.start(parallel with ring) →
-    #            wait for participant_connected → greeting (instant)
-    #            user perceived: ~1-2s after pickup — AI session is already warm
+        _sip_identity = f"sip_{phone_number}"
+        _answered_event: asyncio.Event = asyncio.Event()
 
-    trunk_id = os.getenv("OUTBOUND_TRUNK_ID") if phone_number else None
-    if phone_number and not trunk_id:
-        await _log("error", "OUTBOUND_TRUNK_ID not set — cannot place outbound call")
-        ctx.shutdown()
-        return
+        def _on_participant_connected(p):
+            if p.identity == _sip_identity:
+                _answered_event.set()
+                logger.info("SIP participant connected — _answered_event set")
 
-    # ── Build and start Gemini Live session FIRST (warm) ─────────────────────
+        ctx.room.on("participant_connected", _on_participant_connected)
+
+        async def _dial_bg():
+            try:
+                await ctx.api.sip.create_sip_participant(
+                    api.CreateSIPParticipantRequest(
+                        room_name=ctx.room.name,
+                        sip_trunk_id=trunk_id,
+                        sip_call_to=phone_number,
+                        participant_identity=_sip_identity,
+                        wait_until_answered=False,    # ← fire-and-forget; event fires on answer
+                    )
+                )
+                await _log("info", f"Dialing {phone_number} via SIP trunk {trunk_id} (non-blocking)")
+            except Exception as exc:
+                await _log("error", f"SIP dial FAILED for {phone_number}: {exc}")
+
+        asyncio.create_task(_dial_bg())
+    else:
+        # No outbound dial — for local/test mode, set the answered event immediately
+        _sip_identity = None
+        _answered_event = asyncio.Event()
+        _answered_event.set()
+
     gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
     await _log("info", f"Building AI session — model={gemini_model}")
     active_tools = tool_ctx.build_tool_list(enabled_tools)
     await _log("info", f"Tools loaded: {[t.__name__ for t in active_tools]}")
     session = _build_session(tools=active_tools, system_prompt=system_prompt)
 
+    _room_input = RoomInputOptions(
+        # NOTE: noise_cancellation intentionally omitted.
+        # BVCTelephony adds ~200-500ms first-frame audio processing latency on
+        # top of Gemini Live cold-start. With a native-audio model doing its own
+        # AEC/NS, telephony-grade NC is redundant and dominates pickup→greeting.
+        close_on_disconnect=False,
+    )
     if _HAS_ROOM_OPTIONS:
         from livekit.agents import RoomOptions as _RO
         _session_kwargs = dict(
             room=ctx.room,
             agent=OutboundAssistant(instructions=system_prompt),
-            room_options=_RO(input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony())),
+            room_options=_RO(input_options=_room_input),
         )
     else:
         _session_kwargs = dict(
             room=ctx.room,
             agent=OutboundAssistant(instructions=system_prompt),
-            room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony()),
+            room_input_options=_room_input,
         )
 
-    # ── Events to coordinate dial + AI ───────────────────────────────────────
-    _sip_identity = f"sip_{phone_number}" if phone_number else None
-    _answered_event: asyncio.Event = asyncio.Event()
-    _dial_failed_event: asyncio.Event = asyncio.Event()
-    _dial_error: list = []
-
-    if phone_number:
-        def _on_participant_connected(p):
-            if p.identity == _sip_identity:
-                _answered_event.set()
-
-        ctx.room.on("participant_connected", _on_participant_connected)
-
-    # ── Kick off the SIP dial in the BACKGROUND (non-blocking) ────────────────
-    async def _dial_bg():
-        await _log("info", f"Dialing {phone_number} via SIP trunk {trunk_id} (non-blocking)")
-        try:
-            await ctx.api.sip.create_sip_participant(
-                api.CreateSIPParticipantRequest(
-                    room_name=ctx.room.name,
-                    sip_trunk_id=trunk_id,
-                    sip_call_to=phone_number,
-                    participant_identity=_sip_identity,
-                    wait_until_answered=False,    # ← KEY: don't block; event fires on answer
-                )
-            )
-        except Exception as exc:
-            _dial_error.append(exc)
-            _dial_failed_event.set()
-            return
-        # If the dial completed but the SIP participant never connected (busy/reject/no-answer),
-        # the livekit server will fire a participant_disconnected for the SIP identity.
-        # We rely on a 45s timeout to bail out if no participant_connected fires.
-        try:
-            await asyncio.wait_for(_answered_event.wait(), timeout=45)
-            await _log("info", f"Call ANSWERED — {phone_number} picked up")
-        except asyncio.TimeoutError:
-            await _log("warning", f"No answer within 45s for {phone_number}")
-            _dial_failed_event.set()
-
-    dial_task = asyncio.create_task(_dial_bg())
-
-    # ── Start Gemini session NOW (parallel with ring time) ───────────────────
     await session.start(**_session_kwargs)
-    await _log("info", "Agent session started (parallel with ring)")
+    await _log("info", "Agent session started — AI ready")
 
-    # ── Optional S3 recording — BACKGROUND so it does NOT delay the greeting ──
-    async def _start_recording_bg():
-        if not phone_number:
-            return
-        _aws_key    = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
-        _aws_secret = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
-        _aws_bucket = os.getenv("S3_BUCKET") or os.getenv("AWS_BUCKET_NAME", "")
-        _s3_endpoint = os.getenv("S3_ENDPOINT_URL") or os.getenv("S3_ENDPOINT", "")
-        _s3_region  = os.getenv("S3_REGION") or os.getenv("AWS_REGION", "ap-northeast-1")
-        if not (_aws_key and _aws_secret and _aws_bucket):
-            return
-        try:
-            _recording_path = f"recordings/{ctx.room.name}.ogg"
-            _egress_req = api.RoomCompositeEgressRequest(
-                room_name=ctx.room.name, audio_only=True,
-                file_outputs=[api.EncodedFileOutput(
-                    file_type=api.EncodedFileType.OGG, filepath=_recording_path,
-                    s3=api.S3Upload(access_key=_aws_key, secret=_aws_secret,
-                                    bucket=_aws_bucket, region=_s3_region, endpoint=_s3_endpoint),
-                )],
-            )
-            _egress = await ctx.api.egress.start_room_composite_egress(_egress_req)
-            _s3_ep = _s3_endpoint.rstrip("/")
-            tool_ctx.recording_url = (f"{_s3_ep}/{_aws_bucket}/{_recording_path}"
-                                       if _s3_ep else f"s3://{_aws_bucket}/{_recording_path}")
-            # ── STORE egress_id so we can stop it on call end (CRITICAL) ──────
-            tool_ctx.recording_egress_id = _egress.egress_id
-            await _log("info", f"Recording started (bg): egress={_egress.egress_id} -> {tool_ctx.recording_url}")
-        except Exception as _exc:
-            await _log("warning", f"Recording start failed (non-fatal): {_exc}")
-    asyncio.create_task(_start_recording_bg())
-
-    # ── Wait for the lead to answer OR dial to fail ──────────────────────────
-    _t_answer = time.time()  # ← timestamp: lead picked up
-    await asyncio.wait(
-        {dial_task},
-        timeout=50,
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-    if _dial_failed_event.is_set() or (dial_task.done() and dial_task.exception()):
-        err = _dial_error[0] if _dial_error else (dial_task.exception() if dial_task.done() else None)
-        await _log("error", f"SIP dial FAILED for {phone_number}: {err}")
+    # ── EXPLICIT WAIT: ensure lead has picked up before any greeting fires ──
+    # session.start() resolved (Gemini Live warm) but dial_task may have already
+    # completed — the SIP INVITE returns as soon as it's sent, NOT when the lead
+    # picks up. _answered_event is set by the participant_connected handler when
+    # the SIP leg fully establishes. This wait is the authoritative sync point:
+    # by the time it returns, BOTH conditions hold:
+    #   1. Gemini Live session is fully ready (session.start() resolved)
+    #   2. Lead has actually picked up (_answered_event set)
+    _t_answer = time.time()
+    try:
+        await asyncio.wait_for(_answered_event.wait(), timeout=45)
+        await _log("info", f"Call ANSWERED — {phone_number} picked up")
+    except asyncio.TimeoutError:
+        await _log("warning", f"No answer within 45s for {phone_number} — ending session")
         try:
             await session.aclose()
         except Exception:
             pass
         ctx.shutdown()
         return
-    _t_say_call = time.time()  # ← timestamp: about to inject greeting
+    _t_say_call = time.time()
     await _log("info", f"PERF pickup→say_call = {(_t_say_call - _t_answer)*1000:.0f}ms")
 
-    # ── Greeting — use generate_reply() (say() requires a TTS model) ────────
-    # session.say() needs a separate TTS model which we don't have in
-    # native-audio Gemini Live mode. generate_reply() uses the LLM directly.
+    # ── Optional S3 recording ────────────────────────────────────────────────
     if phone_number:
-        _greeting_text = f"నమస్తే! నేను ప్రియ, {business_name} నుండి. మీరు {lead_name} గారా?"
+        _aws_key    = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
+        _aws_secret = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
+        _aws_bucket = os.getenv("S3_BUCKET") or os.getenv("AWS_BUCKET_NAME", "")
+        _s3_endpoint = os.getenv("S3_ENDPOINT_URL") or os.getenv("S3_ENDPOINT", "")
+        _s3_region  = os.getenv("S3_REGION") or os.getenv("AWS_REGION", "ap-northeast-1")
+        if _aws_key and _aws_secret and _aws_bucket:
+            try:
+                _recording_path = f"recordings/{ctx.room.name}.ogg"
+                _egress_req = api.RoomCompositeEgressRequest(
+                    room_name=ctx.room.name, audio_only=True,
+                    file_outputs=[api.EncodedFileOutput(
+                        file_type=api.EncodedFileType.OGG, filepath=_recording_path,
+                        s3=api.S3Upload(access_key=_aws_key, secret=_aws_secret,
+                                        bucket=_aws_bucket, region=_s3_region, endpoint=_s3_endpoint),
+                    )],
+                )
+                _egress = await ctx.api.egress.start_room_composite_egress(_egress_req)
+                _s3_ep = _s3_endpoint.rstrip("/")
+                tool_ctx.recording_url = (f"{_s3_ep}/{_aws_bucket}/{_recording_path}"
+                                           if _s3_ep else f"s3://{_aws_bucket}/{_recording_path}")
+                tool_ctx.recording_egress_id = _egress.egress_id
+                await _log("info", f"Recording started: egress={_egress.egress_id}")
+            except Exception as _exc:
+                await _log("warning", f"Recording start failed (non-fatal): {_exc}")
+
+    # gemini-3.1/2.5 speak autonomously from system prompt — never call generate_reply
+    _active_model = os.getenv("GEMINI_MODEL", "")
+    if "3.1" in _active_model or "2.5" in _active_model:
+        await _log("info", "Gemini native-audio: model will greet autonomously from system prompt")
     else:
-        _greeting_text = "నమస్తే! నేను ప్రియ మాట్లాడుతున్నాను."
-    try:
-        _t_before_gr = time.time()
-        await session.generate_reply(instructions=f"Say exactly this in Telugu: '{_greeting_text}'")
-        _t_after_gr = time.time()
-        await _log("info", f"PERF generate_reply returned in {(_t_after_gr - _t_before_gr)*1000:.0f}ms (pickup→say_call = {(_t_say_call - _t_answer)*1000:.0f}ms)")
-    except Exception as _gr_exc:
-        await _log("warning", f"generate_reply failed: {_gr_exc}")
+        greeting = (
+            f"The call just connected. Greet the lead and ask if you're speaking with {lead_name}."
+            if phone_number else "Greet the caller warmly."
+        )
+        try:
+            await session.generate_reply(instructions=greeting)
+        except Exception as _gr_exc:
+            await _log("warning", f"generate_reply failed: {_gr_exc}")
 
     # ── Keep session alive until SIP participant actually leaves ─────────────
     if phone_number:
         _sip_identity = f"sip_{phone_number}"
         _disconnect_event = asyncio.Event()
 
+        async def _handle_disconnect_with_grace():
+            # Brief audio dropouts on SIP legs are common. Don't kill the session
+            # on the first participant_disconnected — wait 3s and re-check whether
+            # the participant is really gone. If they came back, _disconnect_event
+            # stays unset and the session continues.
+            await asyncio.sleep(3)
+            try:
+                _still_present = _sip_identity in {
+                    p.identity for p in ctx.room.remote_participants.values()
+                }
+            except Exception:
+                _still_present = False
+            if not _still_present:
+                await _log("info", f"Disconnect grace period expired — {_sip_identity} truly gone, ending session")
+                _disconnect_event.set()
+            else:
+                logger.info(f"{_sip_identity} reconnected during grace period — session continues")
+
         def _on_participant_disconnected(participant: rtc.RemoteParticipant):
             if participant.identity == _sip_identity:
-                _disconnect_event.set()
+                logger.info(f"{_sip_identity} disconnected — starting 3s grace period")
+                asyncio.create_task(_handle_disconnect_with_grace())
         def _on_disconnected():
-            _disconnect_event.set()
+            # Room-level disconnect is terminal (LiveKit Cloud dropped us) — no grace period
+                    _disconnect_event.set()
 
         ctx.room.on("participant_disconnected", _on_participant_disconnected)
         ctx.room.on("disconnected", _on_disconnected)

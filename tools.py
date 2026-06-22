@@ -15,6 +15,10 @@ from db import (
 
 logger = logging.getLogger("appointment-tools")
 
+# Fallback string returned to the model when a tool times out (10s).
+# Don't tell the user there's an error — just nudge the agent to keep talking.
+_TOOL_TIMEOUT_MSG = "Tool request timed out. Please continue the conversation."
+
 
 async def _log(msg: str, detail: str = "", level: str = "info") -> None:
     try:
@@ -47,6 +51,7 @@ class AppointmentTools(llm.ToolContext):
         name_map = {m.__name__: m for m in all_methods}
         return [name_map[n] for n in enabled if n in name_map]
 
+    # ── check_availability ────────────────────────────────────────────────────
     @llm.function_tool
     async def check_availability(self, date: str, time: str) -> str:
         """
@@ -56,13 +61,22 @@ class AppointmentTools(llm.ToolContext):
         Returns 'available' or 'unavailable: next available slot is <slot>'.
         """
         try:
-            if await check_slot(date, time):
-                return "available"
-            next_slot = await get_next_available(date, time)
-            return f"unavailable: next available slot is {next_slot}"
+            return await asyncio.wait_for(
+                self._check_availability_actual(date, time), timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("check_availability timed out after 10s")
+            return _TOOL_TIMEOUT_MSG
         except Exception:
             return "Unable to check availability right now — please suggest a date and I will confirm."
 
+    async def _check_availability_actual(self, date: str, time: str) -> str:
+        if await check_slot(date, time):
+            return "available"
+        next_slot = await get_next_available(date, time)
+        return f"unavailable: next available slot is {next_slot}"
+
+    # ── book_appointment ──────────────────────────────────────────────────────
     @llm.function_tool
     async def book_appointment(self, name: str, phone: str, date: str, time: str, service: str) -> str:
         """
@@ -71,16 +85,25 @@ class AppointmentTools(llm.ToolContext):
         name: lead's full name | phone: with country code | date: YYYY-MM-DD | time: HH:MM | service: type
         """
         try:
-            booking_id = await insert_appointment(name, phone, date, time, service)
-            if booking_id is None:
-                return (
-                    f"Sorry, {date} at {time} was just booked by someone else. "
-                    f"Please call check_availability to find the next open slot."
-                )
-            return f"Confirmed! Booking ID: {booking_id}. See you on {date} at {time} for {service}."
+            return await asyncio.wait_for(
+                self._book_appointment_actual(name, phone, date, time, service), timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("book_appointment timed out after 10s")
+            return _TOOL_TIMEOUT_MSG
         except Exception:
             return "Technical issue saving the booking. Our team will confirm shortly."
 
+    async def _book_appointment_actual(self, name: str, phone: str, date: str, time: str, service: str) -> str:
+        booking_id = await insert_appointment(name, phone, date, time, service)
+        if booking_id is None:
+            return (
+                f"Sorry, {date} at {time} was just booked by someone else. "
+                f"Please call check_availability to find the next open slot."
+            )
+        return f"Confirmed! Booking ID: {booking_id}. See you on {date} at {time} for {service}."
+
+    # ── end_call ──────────────────────────────────────────────────────────────
     @llm.function_tool
     async def end_call(self, outcome: str, reason: str = "") -> str:
         """
@@ -88,6 +111,18 @@ class AppointmentTools(llm.ToolContext):
         outcome: 'booked' | 'not_interested' | 'wrong_number' | 'voicemail' | 'no_answer' | 'callback_requested'
         reason: brief description
         """
+        try:
+            return await asyncio.wait_for(
+                self._end_call_actual(outcome, reason), timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("end_call timed out after 10s")
+            return _TOOL_TIMEOUT_MSG
+        except Exception as exc:
+            logger.error("end_call failed: %s", exc)
+            return "Call ending — log may not have written."
+
+    async def _end_call_actual(self, outcome: str, reason: str) -> str:
         duration = int(time.time() - self._call_start_time)
         try:
             await log_call(
@@ -104,6 +139,7 @@ class AppointmentTools(llm.ToolContext):
             pass
         return "Call ended."
 
+    # ── transfer_to_human ─────────────────────────────────────────────────────
     @llm.function_tool
     async def transfer_to_human(self, reason: str) -> str:
         """
@@ -111,6 +147,17 @@ class AppointmentTools(llm.ToolContext):
         Call when lead requests a human, is angry, or has a complex issue.
         reason: why you're transferring
         """
+        try:
+            return await asyncio.wait_for(
+                self._transfer_to_human_actual(reason), timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("transfer_to_human timed out after 10s")
+            return _TOOL_TIMEOUT_MSG
+        except Exception:
+            return "Transfer failed. Please call us back directly."
+
+    async def _transfer_to_human_actual(self, reason: str) -> str:
         destination = os.getenv("DEFAULT_TRANSFER_NUMBER", "")
         if not destination:
             return "Transfer unavailable: no fallback number configured."
@@ -126,38 +173,45 @@ class AppointmentTools(llm.ToolContext):
                 break
         if not participant_identity:
             return "Transfer failed: could not identify caller."
-        try:
-            await self.ctx.api.sip.transfer_sip_participant(
-                api.TransferSIPParticipantRequest(
-                    room_name=self.ctx.room.name,
-                    participant_identity=participant_identity,
-                    transfer_to=destination, play_dialtone=False,
-                )
+        await self.ctx.api.sip.transfer_sip_participant(
+            api.TransferSIPParticipantRequest(
+                room_name=self.ctx.room.name,
+                participant_identity=participant_identity,
+                transfer_to=destination, play_dialtone=False,
             )
-            return "Transferring you to a human agent now. Please hold."
-        except Exception:
-            return "Transfer failed. Please call us back directly."
+        )
+        return "Transferring you to a human agent now. Please hold."
 
+    # ── send_sms_confirmation ─────────────────────────────────────────────────
     @llm.function_tool
     async def send_sms_confirmation(self, phone: str, message: str) -> str:
         """
         Send SMS confirmation after a successful booking. Skips silently if Twilio not configured.
         phone: lead's phone | message: text to send
         """
+        try:
+            return await asyncio.wait_for(
+                self._send_sms_confirmation_actual(phone, message), timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("send_sms_confirmation timed out after 10s")
+            return _TOOL_TIMEOUT_MSG
+        except Exception:
+            return "SMS delivery failed, but booking is confirmed."
+
+    async def _send_sms_confirmation_actual(self, phone: str, message: str) -> str:
         sid = os.getenv("TWILIO_ACCOUNT_SID", "")
         token = os.getenv("TWILIO_AUTH_TOKEN", "")
         from_num = os.getenv("TWILIO_FROM_NUMBER", "")
         if not (sid and token and from_num):
             return "SMS skipped: Twilio not configured."
-        try:
-            from twilio.rest import Client
-            loop = asyncio.get_event_loop()
-            client = Client(sid, token)
-            await loop.run_in_executor(None, lambda: client.messages.create(body=message, from_=from_num, to=phone))
-            return f"SMS sent to {phone}."
-        except Exception:
-            return "SMS delivery failed, but booking is confirmed."
+        from twilio.rest import Client
+        loop = asyncio.get_event_loop()
+        client = Client(sid, token)
+        await loop.run_in_executor(None, lambda: client.messages.create(body=message, from_=from_num, to=phone))
+        return f"SMS sent to {phone}."
 
+    # ── lookup_contact ────────────────────────────────────────────────────────
     @llm.function_tool
     async def lookup_contact(self, phone: str) -> str:
         """
@@ -166,43 +220,52 @@ class AppointmentTools(llm.ToolContext):
         Returns call history, appointments, and remembered details.
         """
         try:
-            # Run all three queries concurrently — saves ~200-400ms vs serial
-            calls, appointments, memories = await asyncio.gather(
-                get_calls_by_phone(phone),
-                get_appointments_by_phone(phone),
-                get_contact_memory(phone),
-                return_exceptions=True,
+            return await asyncio.wait_for(
+                self._lookup_contact_actual(phone), timeout=10.0
             )
-            # Defensive: if any one query raised, treat it as empty rather than blowing up
-            if isinstance(calls, Exception):
-                logger.warning("lookup_contact: calls fetch failed: %s", calls)
-                calls = []
-            if isinstance(appointments, Exception):
-                logger.warning("lookup_contact: appointments fetch failed: %s", appointments)
-                appointments = []
-            if isinstance(memories, Exception):
-                logger.warning("lookup_contact: memories fetch failed: %s", memories)
-                memories = []
-            if not calls and not appointments and not memories:
-                return f"No history for {phone}. First-time contact."
-            lines = [f"Contact history for {phone}:"]
-            if memories:
-                lines.append(f"\nREMEMBERED ({len(memories)} notes):")
-                for m in memories[:10]:
-                    lines.append(f"  • {m['insight']}")
-            if calls:
-                lines.append(f"\nCALL HISTORY ({len(calls)} calls):")
-                for c in calls[:5]:
-                    ts = (c.get("timestamp") or "")[:16]
-                    lines.append(f"  • {ts} — {c.get('outcome','?')}: {c.get('reason','')}")
-            if appointments:
-                lines.append(f"\nAPPOINTMENTS ({len(appointments)}):")
-                for a in appointments[:3]:
-                    lines.append(f"  • {a.get('date')} {a.get('time')} — {a.get('service')} [{a.get('status')}]")
-            return "\n".join(lines)
+        except asyncio.TimeoutError:
+            logger.warning("lookup_contact timed out after 10s")
+            return _TOOL_TIMEOUT_MSG
         except Exception:
             return "Unable to retrieve contact history."
 
+    async def _lookup_contact_actual(self, phone: str) -> str:
+        # Run all three queries concurrently — saves ~200-400ms vs serial
+        calls, appointments, memories = await asyncio.gather(
+            get_calls_by_phone(phone),
+            get_appointments_by_phone(phone),
+            get_contact_memory(phone),
+            return_exceptions=True,
+        )
+        # Defensive: if any one query raised, treat it as empty rather than blowing up
+        if isinstance(calls, Exception):
+            logger.warning("lookup_contact: calls fetch failed: %s", calls)
+            calls = []
+        if isinstance(appointments, Exception):
+            logger.warning("lookup_contact: appointments fetch failed: %s", appointments)
+            appointments = []
+        if isinstance(memories, Exception):
+            logger.warning("lookup_contact: memories fetch failed: %s", memories)
+            memories = []
+        if not calls and not appointments and not memories:
+            return f"No history for {phone}. First-time contact."
+        lines = [f"Contact history for {phone}:"]
+        if memories:
+            lines.append(f"\nREMEMBERED ({len(memories)} notes):")
+            for m in memories[:10]:
+                lines.append(f"  • {m['insight']}")
+        if calls:
+            lines.append(f"\nCALL HISTORY ({len(calls)} calls):")
+            for c in calls[:5]:
+                ts = (c.get("timestamp") or "")[:16]
+                lines.append(f"  • {ts} — {c.get('outcome','?')}: {c.get('reason','')}")
+        if appointments:
+            lines.append(f"\nAPPOINTMENTS ({len(appointments)}):")
+            for a in appointments[:3]:
+                lines.append(f"  • {a.get('date')} {a.get('time')} — {a.get('service')} [{a.get('status')}]")
+        return "\n".join(lines)
+
+    # ── remember_details ──────────────────────────────────────────────────────
     @llm.function_tool
     async def remember_details(self, insight: str) -> str:
         """
@@ -211,17 +274,26 @@ class AppointmentTools(llm.ToolContext):
         Examples: "Prefers morning calls", "Has 2 kids, interested in family plan", "Callback in 2 weeks"
         insight: the detail to remember
         """
-        if not self.phone_number:
-            return "Cannot remember — no phone number for this call."
         try:
-            await add_contact_memory(self.phone_number, insight)
-            memories = await get_contact_memory(self.phone_number)
-            if len(memories) >= 5:
-                asyncio.create_task(self._compress_memories())
-            return f"Remembered: {insight}"
+            return await asyncio.wait_for(
+                self._remember_details_actual(insight), timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("remember_details timed out after 10s")
+            return _TOOL_TIMEOUT_MSG
         except Exception:
             return "Could not save detail."
 
+    async def _remember_details_actual(self, insight: str) -> str:
+        if not self.phone_number:
+            return "Cannot remember — no phone number for this call."
+        await add_contact_memory(self.phone_number, insight)
+        memories = await get_contact_memory(self.phone_number)
+        if len(memories) >= 5:
+            asyncio.create_task(self._compress_memories())
+        return f"Remembered: {insight}"
+
+    # ── _compress_memories (internal helper, NOT a tool) ──────────────────────
     async def _compress_memories(self) -> None:
         try:
             memories = await get_contact_memory(self.phone_number)
@@ -242,57 +314,75 @@ class AppointmentTools(llm.ToolContext):
         except Exception as exc:
             logger.warning("Memory compression failed: %s", exc)
 
+    # ── book_calcom ───────────────────────────────────────────────────────────
     @llm.function_tool
     async def book_calcom(self, name: str, email: str, date: str, start_time: str, notes: str = "") -> str:
         """
         Book in Cal.com calendar after book_appointment succeeds.
         name: full name | email: lead's email | date: YYYY-MM-DD | start_time: HH:MM | notes: optional
         """
+        try:
+            return await asyncio.wait_for(
+                self._book_calcom_actual(name, email, date, start_time, notes), timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("book_calcom timed out after 10s")
+            return _TOOL_TIMEOUT_MSG
+        except Exception as exc:
+            return f"Cal.com booking failed: {exc}"
+
+    async def _book_calcom_actual(self, name: str, email: str, date: str, start_time: str, notes: str) -> str:
         api_key = os.getenv("CALCOM_API_KEY", "")
         event_type_id = os.getenv("CALCOM_EVENT_TYPE_ID", "")
         timezone = os.getenv("CALCOM_TIMEZONE", "Asia/Kolkata")
         if not api_key or not event_type_id:
             return "Cal.com not configured — skipping. Add CALCOM_API_KEY and CALCOM_EVENT_TYPE_ID."
-        try:
-            from datetime import datetime as _dt
-            start_dt = _dt.strptime(f"{date} {start_time}", "%Y-%m-%d %H:%M")
-            start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            import httpx
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.post(
-                    "https://api.cal.com/v1/bookings",
-                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                    json={"eventTypeId": int(event_type_id), "start": start_iso, "timeZone": timezone,
-                          "responses": {"name": name, "email": email, "notes": notes},
-                          "metadata": {"source": "OutboundAI"}, "language": "en"},
-                )
-            data = resp.json()
-            if resp.status_code not in (200, 201):
-                raise ValueError(data.get("message") or str(data))
-            uid = data.get("uid", "")
-            return f"Cal.com booked. UID: {uid}"
-        except Exception as exc:
-            return f"Cal.com booking failed: {exc}"
+        from datetime import datetime as _dt
+        start_dt = _dt.strptime(f"{date} {start_time}", "%Y-%m-%d %H:%M")
+        start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        import httpx
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://api.cal.com/v1/bookings",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"eventTypeId": int(event_type_id), "start": start_iso, "timeZone": timezone,
+                      "responses": {"name": name, "email": email, "notes": notes},
+                      "metadata": {"source": "OutboundAI"}, "language": "en"},
+            )
+        data = resp.json()
+        if resp.status_code not in (200, 201):
+            raise ValueError(data.get("message") or str(data))
+        uid = data.get("uid", "")
+        return f"Cal.com booked. UID: {uid}"
 
+    # ── cancel_calcom ─────────────────────────────────────────────────────────
     @llm.function_tool
     async def cancel_calcom(self, booking_uid: str, reason: str = "") -> str:
         """
         Cancel a Cal.com booking by UID.
         booking_uid: from book_calcom | reason: optional
         """
+        try:
+            return await asyncio.wait_for(
+                self._cancel_calcom_actual(booking_uid, reason), timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("cancel_calcom timed out after 10s")
+            return _TOOL_TIMEOUT_MSG
+        except Exception as exc:
+            return f"Cancellation failed: {exc}"
+
+    async def _cancel_calcom_actual(self, booking_uid: str, reason: str) -> str:
         api_key = os.getenv("CALCOM_API_KEY", "")
         if not api_key:
             return "Cal.com not configured."
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.delete(
-                    f"https://api.cal.com/v1/bookings/{booking_uid}",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    params={"reason": reason} if reason else {},
-                )
-            if resp.status_code not in (200, 204):
-                raise ValueError(f"HTTP {resp.status_code}")
-            return f"Cancelled Cal.com booking {booking_uid}."
-        except Exception as exc:
-            return f"Cancellation failed: {exc}"
+        import httpx
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.delete(
+                f"https://api.cal.com/v1/bookings/{booking_uid}",
+                headers={"Authorization": f"Bearer {api_key}"},
+                params={"reason": reason} if reason else {},
+            )
+        if resp.status_code not in (200, 204):
+            raise ValueError(f"HTTP {resp.status_code}")
+        return f"Cancelled Cal.com booking {booking_uid}."

@@ -613,10 +613,20 @@ async function loadCalls(page = 1) {
   if (!_callsData.length) { $('calls-list').innerHTML = '<p style="color:var(--text2)">No calls yet</p>'; return; }
   let html = '<table><tr><th>Phone</th><th>Lead</th><th>Outcome</th><th>Duration</th><th>Time</th><th>Recording</th><th>Notes</th></tr>';
   _callsData.forEach(c => {
+    // Inline audio player — plays inside the dashboard, never redirects.
+    // Uses HTML5 <audio controls> so the browser handles play/pause/seek.
+    // `preload="metadata"` loads just the WAV header so the duration shows
+    // up before the user clicks play (small bandwidth cost).
+    const recCell = c.recording_url
+      ? `<audio controls preload="metadata" style="height:30px;max-width:220px;vertical-align:middle"
+              src="${c.recording_url}"></audio>
+         <a href="${c.recording_url}" download title="Download"
+            style="color:var(--accent2);text-decoration:none;margin-left:6px;font-size:14px">⬇</a>`
+      : '—';
     html += `<tr><td>${c.phone_number}</td><td>${c.lead_name||'—'}</td>
       <td><span class="badge ${c.outcome||''}">${c.outcome||'—'}</span></td>
       <td>${c.duration_seconds||0}s</td><td style="font-size:11px">${(c.timestamp||'').slice(0,16)}</td>
-      <td>${c.recording_url ? `<a href="${c.recording_url}" target="_blank" style="color:var(--accent2)">🎧</a>` : '—'}</td>
+      <td>${recCell}</td>
       <td><textarea class="notes-input" id="notes-${c.id}">${c.notes||''}</textarea>
         <button class="btn sm" onclick="saveNotes('${c.id}')">Save</button></td></tr>`;
   });

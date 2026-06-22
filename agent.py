@@ -1,9 +1,13 @@
 import asyncio
+import io
 import json
 import logging
 import os
 import ssl
+import struct
+import tempfile
 import time
+import wave
 import certifi
 from typing import Optional
 
@@ -182,6 +186,213 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
 class OutboundAssistant(Agent):
     def __init__(self, instructions: str) -> None:
         super().__init__(instructions=instructions)
+
+
+# ── CALL RECORDER ────────────────────────────────────────────────────────────
+# Self-contained recorder that runs inside the agent process — bypasses
+# LiveKit's egress service entirely (which has a monthly minutes quota
+# that we kept hitting). Subscribes to every audio track in the room, writes
+# raw PCM to a temp file, and on finalize() returns WAV bytes ready for
+# Supabase Storage upload.
+#
+# Why not the LiveKit egress service?
+#   • Quota: 49 prior egress attempts had used up the project's monthly
+#     minutes. start_egress now returns HTTP 429.
+#   • Reliability: the egress service runs on LiveKit's side. If their
+#     infra hiccups, recordings vanish. Self-recording stays local until
+#     we explicitly upload it.
+#
+# Output: 48kHz mono 16-bit PCM wrapped in a WAV header. ~5.7 MB/min.
+# Format: WAV (instead of OGG) so the dashboard can <audio src> it directly.
+
+class CallRecorder:
+    def __init__(self, room, sample_rate: int = 48000, num_channels: int = 1):
+        self.room = room
+        # Fallbacks — _consume() detects the real values from the first frame
+        # so the WAV header always matches the actual audio data.
+        self.sample_rate = sample_rate
+        self.num_channels = num_channels
+        # Per-track byte buffers so we can MIX (sum int16 samples with clipping)
+        # all subscribed tracks at finalize time. Without this, writing both
+        # AI + lead tracks to the same file made the WAV twice as long as
+        # the call → playback at half speed.
+        self._data_by_track: dict[str, bytearray] = {}
+        self._subscribed: set = set()
+        self._tasks: list = []
+        self._stopped = False
+        self._detected_sample_rate: Optional[int] = None
+        self._detected_num_channels: Optional[int] = None
+        # Stream raw PCM to per-track buffers (kept in memory for fast mixing)
+        self._tmpfile = tempfile.NamedTemporaryFile(prefix="call_rec_", suffix=".pcm", delete=False)
+        self._tmpfile_path = self._tmpfile.name
+        self._tmpfile.close()
+
+    async def start(self) -> None:
+        """Subscribe to existing + future audio tracks in the room."""
+        await self._scan_existing_tracks()
+        self.room.on("track_subscribed", self._on_track_subscribed)
+
+    async def _scan_existing_tracks(self) -> None:
+        participants = [self.room.local_participant] + list(self.room.remote_participants.values())
+        for p in participants:
+            for pub in p.track_publications.values():
+                if pub.track and pub.track.kind == rtc.TrackKind.KIND_AUDIO:
+                    self._subscribe(pub.track)
+
+    def _on_track_subscribed(self, track, publication, participant) -> None:
+        if track.kind == rtc.TrackKind.KIND_AUDIO:
+            self._subscribe(track)
+
+    def _subscribe(self, track) -> None:
+        if track.sid in self._subscribed:
+            return
+        self._subscribed.add(track.sid)
+        self._data_by_track[track.sid] = bytearray()
+        # Explicitly request 48kHz mono from AudioStream so we know exactly
+        # what rate we'll write to the WAV. If the SDK can't resample, we
+        # fall back to whatever the track's native rate is and detect it
+        # in _consume() — then write the WAV header with that real rate.
+        try:
+            stream = rtc.AudioStream(track, sample_rate=48000, num_channels=1)
+        except TypeError:
+            try:
+                stream = rtc.AudioStream(track)
+            except Exception:
+                return
+        task = asyncio.create_task(self._consume(stream, track.sid))
+        self._tasks.append(task)
+
+    async def _consume(self, stream, track_sid: str) -> None:
+        try:
+            async for event in stream:
+                if self._stopped:
+                    break
+                if event.frame and event.frame.data:
+                    # Capture the actual sample rate / channel count from
+                    # the first frame we see.
+                    if self._detected_sample_rate is None and event.frame.sample_rate:
+                        self._detected_sample_rate = event.frame.sample_rate
+                        self._detected_num_channels = event.frame.num_channels
+                        logger.info(
+                            f"CallRecorder detected: sample_rate={self._detected_sample_rate} "
+                            f"num_channels={self._detected_num_channels} (track={track_sid[:8]})"
+                        )
+                    # Append to THIS track's buffer — we'll mix all tracks
+                    # at finalize() time so the file has the call's true duration.
+                    self._data_by_track[track_sid].extend(event.frame.data)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug(f"CallRecorder: track {track_sid} ended: {exc}")
+
+    async def finalize(self) -> Optional[bytes]:
+        """
+        Stop recording, mix all subscribed tracks by summing int16 samples
+        (with clipping), and wrap the result in a WAV header.
+
+        Returns None if no audio was captured. Cleans up the temp file.
+
+        Why we mix: when the AI speaks, its audio goes out as a published
+        track. When the lead speaks, their phone sends audio as another
+        track. If we wrote both to one file sequentially, the WAV would
+        be ~2x the actual call duration and the player would treat it
+        as 2x slow audio. Mixing (summing int16 samples with clipping)
+        produces a single mono file that matches the call's true duration.
+        """
+        self._stopped = True
+        # Cancel all consumer tasks
+        for t in self._tasks:
+            t.cancel()
+        # Brief settle
+        await asyncio.sleep(0.2)
+        # Best-effort close of the temp file (no longer used but keep cleanup)
+        try:
+            if os.path.exists(self._tmpfile_path):
+                os.unlink(self._tmpfile_path)
+        except Exception:
+            pass
+
+        # Collect each track's bytes
+        track_datas = [bytes(d) for d in self._data_by_track.values() if d]
+        if not track_datas:
+            logger.warning("CallRecorder: no audio captured")
+            return None
+
+        # Mix: sum int16 samples across tracks, clip to int16 range
+        if len(track_datas) == 1:
+            mixed_pcm = track_datas[0]
+            n_tracks = 1
+        else:
+            try:
+                import numpy as np
+                # Decode each track as int16, pad shorter ones with zeros
+                # (shorter track = was active for less time)
+                int16_tracks = []
+                max_len = 0
+                for d in track_datas:
+                    n_samples = len(d) // 2
+                    arr = np.frombuffer(d, dtype=np.int16, count=n_samples)
+                    int16_tracks.append(arr)
+                    if len(arr) > max_len:
+                        max_len = len(arr)
+                mixed = np.zeros(max_len, dtype=np.int32)  # int32 to avoid overflow during sum
+                for arr in int16_tracks:
+                    mixed[:len(arr)] += arr
+                # Clip to int16 range
+                np.clip(mixed, -32768, 32767, out=mixed)
+                mixed_pcm = mixed.astype(np.int16).tobytes()
+                n_tracks = len(int16_tracks)
+            except ImportError:
+                # Fallback: pure-Python int16 summing (slower but no numpy dep)
+                mixed_pcm = self._mix_pure_python(track_datas)
+                n_tracks = len(track_datas)
+
+        # Use the actual sample rate / channel count from the first frame
+        wav_rate   = self._detected_sample_rate or self.sample_rate
+        wav_chans  = self._detected_num_channels or self.num_channels
+        if self._detected_sample_rate and self._detected_sample_rate != 48000:
+            logger.warning(
+                f"CallRecorder: audio native rate is {wav_rate}Hz (not 48kHz) — "
+                f"WAV written at native rate for correct playback speed"
+            )
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(wav_chans)
+            w.setsampwidth(2)              # 16-bit PCM
+            w.setframerate(wav_rate)
+            w.writeframes(mixed_pcm)
+
+        wav_bytes = buf.getvalue()
+        duration_sec = len(mixed_pcm) / (wav_rate * wav_chans * 2)
+        per_track = ", ".join(
+            f"{sid[:8]}={len(d)//1024}KB" for sid, d in self._data_by_track.items() if d
+        )
+        logger.info(
+            f"CallRecorder finalized: {len(wav_bytes)//1024}KB WAV @ {wav_rate}Hz "
+            f"{wav_chans}ch ≈ {duration_sec:.1f}s ({n_tracks} tracks mixed: {per_track})"
+        )
+        return wav_bytes
+
+    @staticmethod
+    def _mix_pure_python(track_datas: list) -> bytes:
+        """Fallback mixer when numpy is unavailable."""
+        int16_tracks = []
+        max_len = 0
+        for d in track_datas:
+            n = len(d) // 2
+            samples = list(struct.unpack(f"<{n}h", d))
+            int16_tracks.append(samples)
+            if len(samples) > max_len:
+                max_len = len(samples)
+        mixed = [0] * max_len
+        for track in int16_tracks:
+            for i, s in enumerate(track):
+                v = mixed[i] + s
+                if v > 32767: v = 32767
+                elif v < -32768: v = -32768
+                mixed[i] = v
+        return struct.pack(f"<{len(mixed)}h", *mixed)
 
 
 async def entrypoint(ctx: agents.JobContext) -> None:
@@ -393,32 +604,20 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     _t_say_call = time.time()
     await _log("info", f"PERF pickup→say_call = {(_t_say_call - _t_answer)*1000:.0f}ms")
 
-    # ── Optional S3 recording ────────────────────────────────────────────────
+    # ── Self-recorder (bypasses LiveKit egress quota) ───────────────────────
+    # We used to call start_room_composite_egress here, but that hits LiveKit
+    # Cloud's monthly minutes quota (HTTP 429 once exhausted). Now we run a
+    # CallRecorder in this agent process — subscribes to all audio tracks,
+    # writes raw PCM to a temp file, and uploads to Supabase Storage at end.
+    recorder: Optional[CallRecorder] = None
     if phone_number:
-        _aws_key    = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
-        _aws_secret = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
-        _aws_bucket = os.getenv("S3_BUCKET") or os.getenv("AWS_BUCKET_NAME", "")
-        _s3_endpoint = os.getenv("S3_ENDPOINT_URL") or os.getenv("S3_ENDPOINT", "")
-        _s3_region  = os.getenv("S3_REGION") or os.getenv("AWS_REGION", "ap-northeast-1")
-        if _aws_key and _aws_secret and _aws_bucket:
-            try:
-                _recording_path = f"recordings/{ctx.room.name}.ogg"
-                _egress_req = api.RoomCompositeEgressRequest(
-                    room_name=ctx.room.name, audio_only=True,
-                    file_outputs=[api.EncodedFileOutput(
-                        file_type=api.EncodedFileType.OGG, filepath=_recording_path,
-                        s3=api.S3Upload(access_key=_aws_key, secret=_aws_secret,
-                                        bucket=_aws_bucket, region=_s3_region, endpoint=_s3_endpoint),
-                    )],
-                )
-                _egress = await ctx.api.egress.start_room_composite_egress(_egress_req)
-                _s3_ep = _s3_endpoint.rstrip("/")
-                tool_ctx.recording_url = (f"{_s3_ep}/{_aws_bucket}/{_recording_path}"
-                                           if _s3_ep else f"s3://{_aws_bucket}/{_recording_path}")
-                tool_ctx.recording_egress_id = _egress.egress_id
-                await _log("info", f"Recording started: egress={_egress.egress_id}")
-            except Exception as _exc:
-                await _log("warning", f"Recording start failed (non-fatal): {_exc}")
+        try:
+            recorder = CallRecorder(ctx.room)
+            await recorder.start()
+            await _log("info", "Self-recorder started (no LiveKit egress minutes consumed)")
+        except Exception as _exc:
+            await _log("warning", f"Self-recorder start failed (non-fatal): {_exc}")
+            recorder = None
 
     # gemini-3.1/2.5 speak autonomously from system prompt — never call generate_reply
     _active_model = os.getenv("GEMINI_MODEL", "")
@@ -474,34 +673,63 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             await _log("warning", "Call reached 1-hour safety timeout — shutting down")
 
         await _log("info", f"SIP participant disconnected — ending session for {phone_number}")
-        # Fallback: ensure the call is logged even if the AI never invoked end_call tool
-        if not getattr(tool_ctx, "_call_logged", False):
+
+        # ── FINALIZE SELF-RECORDER, UPLOAD TO SUPABASE STORAGE ─────────────
+        # We replaced LiveKit's egress service with an in-process recorder.
+        # Now we mix the recorded audio into WAV, upload to Supabase Storage,
+        # and set the recording_url that log_call will use below.
+        if recorder is not None:
             try:
-                _duration = int(time.time() - tool_ctx._call_start_time)
+                _wav = await recorder.finalize()
+                if _wav:
+                    _sb_url   = os.getenv("SUPABASE_URL", "")
+                    _sb_key   = os.getenv("SUPABASE_SERVICE_KEY", "")
+                    _bucket   = os.getenv("S3_BUCKET", "outboundai")
+                    if _sb_url and _sb_key and _bucket:
+                        from supabase import create_client
+                        _sb = create_client(_sb_url, _sb_key)
+                        _path = f"recordings/{ctx.room.name}.wav"
+                        _sb.storage.from_(_bucket).upload(
+                            path=_path,
+                            file=_wav,
+                            file_options={"content-type": "audio/wav", "x-upsert": "true"},
+                        )
+                        # Public URL works if the bucket is publicly readable.
+                        # If the bucket is private, swap to:
+                        #   _sb.storage.from_(_bucket).create_signed_url(_path, 60*60*24*30)
+                        tool_ctx.recording_url = _sb.storage.from_(_bucket).get_public_url(_path)
+                        await _log("info", f"Recording uploaded → {tool_ctx.recording_url} ({len(_wav)//1024}KB)")
+                    else:
+                        await _log("warning", "Supabase creds missing — recording not uploaded")
+                        tool_ctx.recording_url = None
+                else:
+                    await _log("warning", "Recorder finalized with no audio — skipping upload")
+                    tool_ctx.recording_url = None
+            except Exception as _rec_exc:
+                await _log("warning", f"Recording finalize/upload failed (non-fatal): {_rec_exc}")
+                tool_ctx.recording_url = None
+
+        # ── LOG THE CALL (now that we have the recording URL) ──────────────
+        # If the AI invoked end_call tool, the outcome/reason/duration are
+        # already on tool_ctx. Otherwise fall back to "completed" with the
+        # generic "call_ended_before_end_call_tool" reason.
+        if not getattr(tool_ctx, "_call_logged", False):
+            _outcome  = getattr(tool_ctx, "_call_outcome",  "completed")
+            _reason   = getattr(tool_ctx, "_call_reason",   "call_ended_before_end_call_tool")
+            _duration = getattr(tool_ctx, "_call_duration", int(time.time() - tool_ctx._call_start_time))
+            try:
                 await log_call(
                     phone_number=phone_number or "unknown",
                     lead_name=lead_name,
-                    outcome="completed",
-                    reason="call_ended_before_end_call_tool",
+                    outcome=_outcome,
+                    reason=_reason,
                     duration_seconds=_duration,
                     recording_url=getattr(tool_ctx, "recording_url", None),
                 )
                 tool_ctx._call_logged = True
-                await _log("info", f"Fallback log_call() written for {phone_number} ({_duration}s)")
-            except Exception as _fallback_exc:
-                await _log("warning", f"Fallback log_call failed: {_fallback_exc}")
-
-        # ── STOP EGRESS — this triggers the actual S3 upload ────────────────
-        # Without this, LiveKit keeps the recording open indefinitely and the
-        # file never lands in Supabase Storage.
-        _egress_id = getattr(tool_ctx, "recording_egress_id", None)
-        if _egress_id:
-            try:
-                # LiveKit API: stop_egress takes a StopEgressRequest, NOT kwarg
-                await ctx.api.egress.stop_egress(api.StopEgressRequest(egress_id=_egress_id))
-                await _log("info", f"Egress {_egress_id} stopped — uploading recording to S3")
-            except Exception as _stop_exc:
-                await _log("warning", f"Egress stop failed (recording may not upload): {_stop_exc}")
+                await _log("info", f"Call logged: {phone_number} outcome={_outcome} recording={'yes' if tool_ctx.recording_url else 'no'}")
+            except Exception as _log_exc:
+                await _log("warning", f"log_call failed: {_log_exc}")
 
         await session.aclose()
         # ── Close the room so LiveKit doesn't keep it warm ──────────────────

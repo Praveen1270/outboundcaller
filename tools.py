@@ -123,16 +123,12 @@ class AppointmentTools(llm.ToolContext):
             return "Call ending — log may not have written."
 
     async def _end_call_actual(self, outcome: str, reason: str) -> str:
-        duration = int(time.time() - self._call_start_time)
-        try:
-            await log_call(
-                phone_number=self.phone_number or "unknown",
-                lead_name=self.lead_name, outcome=outcome, reason=reason,
-                duration_seconds=duration, recording_url=self.recording_url,
-            )
-            self._call_logged = True
-        except Exception as exc:
-            logger.error("Failed to log call: %s", exc)
+        # Defer log_call to the entrypoint cleanup so it can include the
+        # recording URL (which is only set after the self-recorder finalizes
+        # and uploads to Supabase Storage at the end of the call).
+        self._call_outcome  = outcome
+        self._call_reason   = reason
+        self._call_duration = int(time.time() - self._call_start_time)
         try:
             await self.ctx.room.disconnect()
         except Exception:
